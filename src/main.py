@@ -343,12 +343,50 @@ def get_all_costs(smac: AbstractFacade) -> np.ndarray:
     return np.array(costs)
 
 
+def get_pareto_indices(smac: AbstractFacade) -> tuple:
+    """
+    Extract Pareto-optimal indices from SMAC runhistory.
+    
+    Returns
+    -------
+    pareto_indices : np.ndarray
+        Indices of Pareto-optimal configurations in the config list
+    all_costs : np.ndarray
+        Costs for all configurations (shape: n_configs x 2)
+    """
+    configs = smac.runhistory.get_configs()
+    
+    # Get average costs for each configuration
+    costs = []
+    for config in configs:
+        cost = smac.runhistory.average_cost(config)
+        costs.append(cost)
+    
+    costs = np.array(costs)
+    
+    # Find Pareto front using same algorithm as get_pareto_front
+    is_pareto = np.ones(len(costs), dtype=bool)
+    
+    for i, c in enumerate(costs):
+        if is_pareto[i]:
+            # Check if any other point dominates this one
+            is_pareto[is_pareto] = np.any(costs[is_pareto] < c, axis=1) | np.all(costs[is_pareto] == c, axis=1)
+            is_pareto[i] = True
+    
+    pareto_indices = np.where(is_pareto)[0]
+    
+    return pareto_indices, costs
+
+
 def plot_pareto_comparison(
     results: Dict[str, AbstractFacade],
     output_path: str = "plots/pareto_comparison.png",
 ):
     """
     Plot Pareto fronts for multiple models.
+    
+    Shows all evaluated configurations (non-Pareto in different color, not connected)
+    and Pareto-optimal configurations (highlighted, connected with line).
     
     Parameters
     ----------
@@ -364,58 +402,99 @@ def plot_pareto_comparison(
     colors = {'rf': 'blue', 'mlp': 'orange'}
     markers = {'rf': 'o', 'mlp': 's'}
     
-    # Plot 1: All points with Pareto fronts
+    # Plot 1: All points with Pareto fronts (cost space)
     ax1 = axes[0]
     
     for model_type, smac in results.items():
-        # All points
-        all_costs = get_all_costs(smac)
-        ax1.scatter(
-            all_costs[:, 0], all_costs[:, 1],
-            c=colors[model_type], marker=markers[model_type],
-            alpha=0.3, s=30, label=f'{model_type.upper()} (all)'
-        )
+        # Get Pareto indices and all costs using helper function
+        pareto_indices, all_costs = get_pareto_indices(smac)
         
-        # Pareto front
-        _, pareto_costs = get_pareto_front(smac)
-        ax1.scatter(
-            pareto_costs[:, 0], pareto_costs[:, 1],
-            c=colors[model_type], marker=markers[model_type],
-            s=100, edgecolors='black', linewidths=2,
-            label=f'{model_type.upper()} (Pareto)'
-        )
-        ax1.plot(pareto_costs[:, 0], pareto_costs[:, 1], 
-                 c=colors[model_type], linestyle='--', alpha=0.7)
+        # Separate Pareto and non-Pareto costs using indices
+        non_pareto_indices = np.setdiff1d(np.arange(len(all_costs)), pareto_indices)
+        
+        # Get Pareto costs (sorted, same as get_pareto_front returns)
+        pareto_configs, pareto_costs = get_pareto_front(smac)
+        
+        # Plot NON-PARETO configurations (dominated, gray color, NO line connection)
+        if len(non_pareto_indices) > 0:
+            non_pareto_costs = all_costs[non_pareto_indices]
+            ax1.scatter(
+                non_pareto_costs[:, 0], non_pareto_costs[:, 1],
+                c='lightgray', marker=markers[model_type],
+                alpha=0.4, s=40, edgecolors='gray', linewidths=0.5,
+                label=f'{model_type.upper()} (non-Pareto, dominated)' if model_type == 'rf' else '',
+                zorder=1  # Behind Pareto points
+            )
+        
+        # Plot PARETO FRONT (optimal, bold color, connected with line)
+        if len(pareto_costs) > 0:
+            ax1.scatter(
+                pareto_costs[:, 0], pareto_costs[:, 1],
+                c=colors[model_type], marker=markers[model_type],
+                s=120, edgecolors='black', linewidths=2.5,
+                label=f'{model_type.upper()} (Pareto Front)',
+                zorder=3  # On top
+            )
+            # Connect Pareto points with dashed line (ONLY frontier is connected)
+            ax1.plot(pareto_costs[:, 0], pareto_costs[:, 1], 
+                     c=colors[model_type], linestyle='--', linewidth=2, 
+                     alpha=0.8, zorder=2)
     
     ax1.set_xlabel('Error (1 - Balanced Accuracy)', fontsize=12)
     ax1.set_ylabel('Inconsistency (1 - Counterfactual Consistency)', fontsize=12)
-    ax1.set_title('All Configurations with Pareto Fronts', fontsize=14)
-    ax1.legend()
+    ax1.set_title('All Configurations vs Pareto Front\n(Gray = Dominated, Colored = Pareto Optimal)', fontsize=14, fontweight='bold')
+    ax1.legend(loc='best', fontsize=10)
     ax1.grid(True, alpha=0.3)
     
-    # Plot 2: Just Pareto fronts (cleaner view)
+    # Plot 2: All points with Pareto fronts (score space - higher = better)
     ax2 = axes[1]
     
     for model_type, smac in results.items():
-        _, pareto_costs = get_pareto_front(smac)
+        # Get Pareto indices and all costs using helper function
+        pareto_indices, all_costs = get_pareto_indices(smac)
         
-        # Convert to accuracy/consistency for easier interpretation
-        accuracy = 1 - pareto_costs[:, 0]
-        consistency = 1 - pareto_costs[:, 1]
+        # Separate Pareto and non-Pareto costs using indices
+        non_pareto_indices = np.setdiff1d(np.arange(len(all_costs)), pareto_indices)
         
-        ax2.scatter(
-            accuracy, consistency,
-            c=colors[model_type], marker=markers[model_type],
-            s=100, edgecolors='black', linewidths=2,
-            label=f'{model_type.upper()}'
-        )
-        ax2.plot(accuracy, consistency, 
-                 c=colors[model_type], linestyle='--', alpha=0.7)
+        # Get Pareto costs (sorted, same as get_pareto_front returns)
+        pareto_configs, pareto_costs = get_pareto_front(smac)
+        
+        # Convert all costs to scores (accuracy, consistency)
+        all_scores = 1 - all_costs
+        pareto_scores = 1 - pareto_costs
+        
+        # Plot NON-PARETO configurations (dominated, gray, NO line connection)
+        if len(non_pareto_indices) > 0:
+            non_pareto_scores = all_scores[non_pareto_indices]
+            ax2.scatter(
+                non_pareto_scores[:, 0], non_pareto_scores[:, 1],
+                c='lightgray', marker=markers[model_type],
+                alpha=0.4, s=40, edgecolors='gray', linewidths=0.5,
+                label=f'{model_type.upper()} (non-Pareto, dominated)' if model_type == 'rf' else '',
+                zorder=1  # Behind Pareto points
+            )
+        
+        # Plot PARETO FRONT (optimal, bold color, connected with line)
+        if len(pareto_scores) > 0:
+            accuracy = pareto_scores[:, 0]
+            consistency = pareto_scores[:, 1]
+            
+            ax2.scatter(
+                accuracy, consistency,
+                c=colors[model_type], marker=markers[model_type],
+                s=120, edgecolors='black', linewidths=2.5,
+                label=f'{model_type.upper()} (Pareto Front)',
+                zorder=3  # On top
+            )
+            # Connect Pareto points with dashed line (ONLY frontier is connected)
+            ax2.plot(accuracy, consistency, 
+                     c=colors[model_type], linestyle='--', linewidth=2,
+                     alpha=0.8, zorder=2)
     
     ax2.set_xlabel('Balanced Accuracy', fontsize=12)
     ax2.set_ylabel('Counterfactual Consistency', fontsize=12)
-    ax2.set_title('Pareto Fronts (Higher = Better)', fontsize=14)
-    ax2.legend()
+    ax2.set_title('All Configurations vs Pareto Front (Higher = Better)\n(Gray = Dominated, Colored = Pareto Optimal)', fontsize=14, fontweight='bold')
+    ax2.legend(loc='best', fontsize=10)
     ax2.grid(True, alpha=0.3)
     
     plt.tight_layout()

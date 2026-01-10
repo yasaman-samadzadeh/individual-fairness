@@ -1,0 +1,38 @@
+{
+  "stats": {
+    "submitted": 1,
+    "finished": 1,
+    "running": 0
+  },
+  "data": [
+    {
+      "config_id": 1,
+      "instance": null,
+      "seed": 209652396,
+      "budget": null,
+      "cost": [
+        0.21739268335943285,
+        0.07122624383610476
+      ],
+      "time": 13.729956865310669,
+      "cpu_time": 13.647897999999998,
+      "status": 1,
+      "starttime": 1768061095.837431,
+      "endtime": 1768061109.5688362,
+      "additional_info": {}
+    }
+  ],
+  "configs": {
+    "1": {
+      "activation": "relu",
+      "alpha": 0.0030356995188,
+      "learning_rate_init": 0.000210147218,
+      "n_hidden_layers": 1,
+      "n_neurons": 174,
+      "solver": "adam"
+    }
+  },
+  "config_origins": {
+    "1": "Initial Design: Sobol"
+  }
+}
