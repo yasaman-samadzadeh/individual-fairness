@@ -24,7 +24,13 @@ class DatasetConfig:
     openml_id: int
     
     # Sensitive features available for fairness analysis
-    sensitive_features: Dict[str, str]  # {feature_name: one_hot_column_to_keep}
+    # For binary: {feature_name: one_hot_column_to_keep}
+    # For multiclass: {feature_name: None} and add to multiclass_sensitive_features
+    sensitive_features: Dict[str, Optional[str]]
+    
+    # Multiclass sensitive features: {feature_name: [list of all one-hot column names]}
+    # Used for exhaustive counterfactual evaluation (flip to all other categories)
+    multiclass_sensitive_features: Dict[str, List[str]] = field(default_factory=dict)
     
     # Proxy features for counterfactual evaluation (Approach 2)
     # Maps proxy_name -> column_name (for flipping when sensitive features are removed)
@@ -54,7 +60,19 @@ DATASET_CONFIGS: Dict[str, DatasetConfig] = {
         openml_id=179,
         sensitive_features={
             "sex": "sex_Male",      # Binary: Male=1, Female=0
-            "race": "race_White",   # Binary: White=1, Other=0
+            "race": "race_White",   # Binary: White=1, Other=0 (keeps only race_White)
+            "race_all": None,       # Multiclass: keeps ALL race columns, exhaustive flip
+        },
+        # Multiclass sensitive features: feature_name -> list of all one-hot columns
+        # These will be kept (not dropped) and used for exhaustive counterfactual
+        multiclass_sensitive_features={
+            "race_all": [
+                "race_White", 
+                "race_Black", 
+                "race_Asian-Pac-Islander", 
+                "race_Amer-Indian-Eskimo", 
+                "race_Other"
+            ],
         },
         # Proxy features for Approach 2 (used when sensitive features are removed)
         # relationship_Wife is a strong proxy for sex (Wife implies Female)
@@ -270,28 +288,63 @@ def load_dataset(
     
     if approach == 1:
         # APPROACH 1: Keep sensitive feature, drop other related columns
-        sensitive_col_name = config.sensitive_features[sensitive_feature]
         
-        cols_to_drop_encoded = []
-        if sensitive_feature == "sex":
-            cols_to_drop_encoded += [c for c in X_encoded.columns 
-                                      if c.startswith('sex_') and c != sensitive_col_name]
-        elif sensitive_feature == "race":
-            cols_to_drop_encoded += [c for c in X_encoded.columns 
-                                      if c.startswith('race_') and c != sensitive_col_name]
-        elif sensitive_feature == "personal_status":
-            cols_to_drop_encoded += [c for c in X_encoded.columns 
-                                      if c.startswith('personal_status_') and c != sensitive_col_name]
+        # Check if this is a multiclass sensitive feature
+        is_multiclass = sensitive_feature in config.multiclass_sensitive_features
         
-        X_encoded = X_encoded.drop(columns=cols_to_drop_encoded, errors='ignore')
-        feature_names_final = list(X_encoded.columns)
-        
-        # Find sensitive column index
-        if sensitive_col_name not in feature_names_final:
-            raise ValueError(f"Sensitive column '{sensitive_col_name}' not found.")
-        sensitive_col_idx = feature_names_final.index(sensitive_col_name)
-        
-        print(f"\nSensitive feature: {sensitive_col_name} (index {sensitive_col_idx})")
+        if is_multiclass:
+            # MULTICLASS: Keep ALL columns for this feature
+            multiclass_cols = config.multiclass_sensitive_features[sensitive_feature]
+            
+            # Find which columns exist in the encoded data
+            existing_multiclass_cols = [c for c in multiclass_cols if c in X_encoded.columns]
+            
+            if len(existing_multiclass_cols) == 0:
+                raise ValueError(
+                    f"No multiclass columns found for '{sensitive_feature}'. "
+                    f"Expected: {multiclass_cols}"
+                )
+            
+            # Don't drop any of the multiclass columns
+            # But we need to figure out what prefix to use for dropping other variants
+            # For race_all, the prefix is "race_"
+            feature_prefix = sensitive_feature.replace("_all", "_")
+            
+            # No columns to drop for multiclass - we keep all race columns
+            feature_names_final = list(X_encoded.columns)
+            
+            # Find indices of all multiclass columns
+            sensitive_col_indices = [feature_names_final.index(c) for c in existing_multiclass_cols]
+            sensitive_col_names = existing_multiclass_cols
+            
+            print(f"\nMulticlass sensitive feature: {sensitive_feature}")
+            print(f"  Columns ({len(sensitive_col_indices)}): {sensitive_col_names}")
+            print(f"  Indices: {sensitive_col_indices}")
+            
+        else:
+            # BINARY: Keep only one column, drop others
+            sensitive_col_name = config.sensitive_features[sensitive_feature]
+            
+            cols_to_drop_encoded = []
+            if sensitive_feature == "sex":
+                cols_to_drop_encoded += [c for c in X_encoded.columns 
+                                          if c.startswith('sex_') and c != sensitive_col_name]
+            elif sensitive_feature == "race":
+                cols_to_drop_encoded += [c for c in X_encoded.columns 
+                                          if c.startswith('race_') and c != sensitive_col_name]
+            elif sensitive_feature == "personal_status":
+                cols_to_drop_encoded += [c for c in X_encoded.columns 
+                                          if c.startswith('personal_status_') and c != sensitive_col_name]
+            
+            X_encoded = X_encoded.drop(columns=cols_to_drop_encoded, errors='ignore')
+            feature_names_final = list(X_encoded.columns)
+            
+            # Find sensitive column index
+            if sensitive_col_name not in feature_names_final:
+                raise ValueError(f"Sensitive column '{sensitive_col_name}' not found.")
+            sensitive_col_idx = feature_names_final.index(sensitive_col_name)
+            
+            print(f"\nBinary sensitive feature: {sensitive_col_name} (index {sensitive_col_idx})")
         
     else:
         # APPROACH 2: Remove sensitive features, keep proxy
@@ -353,10 +406,18 @@ def load_dataset(
     }
     
     if approach == 1:
-        result.update({
-            'sensitive_col_idx': sensitive_col_idx,
-            'sensitive_col_name': sensitive_col_name,
-        })
+        if is_multiclass:
+            result.update({
+                'is_multiclass': True,
+                'sensitive_col_indices': sensitive_col_indices,  # List of indices
+                'sensitive_col_names': sensitive_col_names,      # List of column names
+            })
+        else:
+            result.update({
+                'is_multiclass': False,
+                'sensitive_col_idx': sensitive_col_idx,
+                'sensitive_col_name': sensitive_col_name,
+            })
     else:
         result.update({
             'X_protected': X_protected,
@@ -402,7 +463,7 @@ def _preprocess_german_credit_gender(X_df: pd.DataFrame) -> pd.DataFrame:
 
 def create_flipped_data(X: np.ndarray, sensitive_col_idx: int) -> np.ndarray:
     """
-    Create counterfactual data by flipping the sensitive feature.
+    Create counterfactual data by flipping the sensitive feature (binary).
     
     Parameters
     ----------
@@ -419,6 +480,99 @@ def create_flipped_data(X: np.ndarray, sensitive_col_idx: int) -> np.ndarray:
     X_flipped = X.copy()
     X_flipped[:, sensitive_col_idx] = 1 - X_flipped[:, sensitive_col_idx]
     return X_flipped
+
+
+def create_flipped_data_multiclass_exhaustive(
+    X: np.ndarray, 
+    multiclass_col_indices: List[int]
+) -> tuple:
+    """
+    Create exhaustive counterfactual data for multiclass features (e.g., race).
+    
+    For each sample, creates flipped versions for ALL other categories.
+    This enables testing: "Does changing from any race to any other race affect prediction?"
+    
+    Parameters
+    ----------
+    X : np.ndarray
+        Feature matrix
+    multiclass_col_indices : list of int
+        Indices of the one-hot encoded columns for the multiclass feature
+        
+    Returns
+    -------
+    flipped_versions : list of np.ndarray
+        List of K arrays, where K is number of categories.
+        flipped_versions[i] has all samples set to category i.
+    original_categories : np.ndarray
+        Index (0 to K-1) of original category for each sample.
+        Used to know which flips to skip (same category = no flip).
+    """
+    n_categories = len(multiclass_col_indices)
+    
+    # Find original category for each sample (which one-hot column is 1)
+    multiclass_values = X[:, multiclass_col_indices]
+    original_categories = np.argmax(multiclass_values, axis=1)
+    
+    # Create K versions of the data, each with all samples set to category k
+    flipped_versions = []
+    for target_cat_idx in range(n_categories):
+        X_flipped = X.copy()
+        # Set all category columns to 0
+        X_flipped[:, multiclass_col_indices] = 0
+        # Set target category to 1
+        X_flipped[:, multiclass_col_indices[target_cat_idx]] = 1
+        flipped_versions.append(X_flipped)
+    
+    return flipped_versions, original_categories
+
+
+def counterfactual_consistency_multiclass_exhaustive(
+    y_pred_original: np.ndarray,
+    y_preds_flipped: List[np.ndarray],
+    original_categories: np.ndarray
+) -> float:
+    """
+    Calculate counterfactual consistency for multiclass feature using exhaustive method.
+    
+    For each sample, compares original prediction to predictions for ALL other categories.
+    Consistency = fraction of (sample, other_category) pairs where prediction stayed same.
+    
+    Parameters
+    ----------
+    y_pred_original : np.ndarray
+        Original predictions (n_samples,)
+    y_preds_flipped : list of np.ndarray
+        Predictions for each target category, list of K arrays each (n_samples,)
+    original_categories : np.ndarray
+        Original category index for each sample (n_samples,)
+        
+    Returns
+    -------
+    consistency : float
+        Fraction of consistent predictions across all valid flips (0 to 1)
+    """
+    n_samples = len(y_pred_original)
+    n_categories = len(y_preds_flipped)
+    
+    total_consistent = 0
+    total_comparisons = 0
+    
+    for sample_idx in range(n_samples):
+        orig_cat = original_categories[sample_idx]
+        orig_pred = y_pred_original[sample_idx]
+        
+        # Compare to ALL other categories (skip same category)
+        for target_cat in range(n_categories):
+            if target_cat == orig_cat:
+                continue  # Skip - not a real flip
+            
+            flipped_pred = y_preds_flipped[target_cat][sample_idx]
+            if orig_pred == flipped_pred:
+                total_consistent += 1
+            total_comparisons += 1
+    
+    return total_consistent / total_comparisons if total_comparisons > 0 else 1.0
 
 
 def create_cv_splits(X: np.ndarray, y: np.ndarray, n_splits: int = 5, random_state: int = 42):

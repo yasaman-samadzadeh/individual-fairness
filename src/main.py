@@ -50,7 +50,9 @@ from smac.multi_objective.parego import ParEGO
 
 from utils.datasets import (
     load_dataset, 
-    create_flipped_data, 
+    create_flipped_data,
+    create_flipped_data_multiclass_exhaustive,
+    counterfactual_consistency_multiclass_exhaustive,
     list_available_datasets, 
     get_dataset_config
 )
@@ -150,6 +152,10 @@ class FairnessPipeline:
     
     Trains models using cross-validation and evaluates both
     accuracy and counterfactual consistency.
+    
+    Supports both binary and multiclass sensitive features:
+    - Binary: flip single column (0 <-> 1)
+    - Multiclass: exhaustive flip to all other categories, average consistency
     """
     
     def __init__(
@@ -157,7 +163,9 @@ class FairnessPipeline:
         model_type: str,
         X: np.ndarray,
         y: np.ndarray,
-        sensitive_col_idx: int,
+        sensitive_col_idx: Optional[int] = None,
+        sensitive_col_indices: Optional[List[int]] = None,
+        is_multiclass: bool = False,
         n_cv_splits: int = 5,
     ):
         """
@@ -169,16 +177,29 @@ class FairnessPipeline:
             Feature matrix
         y : np.ndarray
             Target labels
-        sensitive_col_idx : int
-            Index of sensitive column for counterfactual
+        sensitive_col_idx : int, optional
+            Index of sensitive column for binary counterfactual
+        sensitive_col_indices : list of int, optional
+            Indices of sensitive columns for multiclass counterfactual
+        is_multiclass : bool
+            If True, use exhaustive multiclass counterfactual
         n_cv_splits : int
             Number of cross-validation splits
         """
         self.model_type = model_type
         self.X = X
         self.y = y
-        self.sensitive_col_idx = sensitive_col_idx
+        self.is_multiclass = is_multiclass
         self.n_cv_splits = n_cv_splits
+        
+        if is_multiclass:
+            if sensitive_col_indices is None:
+                raise ValueError("sensitive_col_indices required for multiclass")
+            self.sensitive_col_indices = sensitive_col_indices
+        else:
+            if sensitive_col_idx is None:
+                raise ValueError("sensitive_col_idx required for binary")
+            self.sensitive_col_idx = sensitive_col_idx
         
         # Pre-compute CV splits for consistency
         cv = StratifiedKFold(n_splits=n_cv_splits, shuffle=True, random_state=42)
@@ -230,9 +251,22 @@ class FairnessPipeline:
                 accuracy_scores.append(acc)
                 
                 # Evaluate counterfactual consistency
-                X_test_flipped = create_flipped_data(X_test, self.sensitive_col_idx)
-                y_pred_flipped = model.predict(X_test_flipped)
-                consistency = counterfactual_consistency(y_pred, y_pred_flipped)
+                if self.is_multiclass:
+                    # Multiclass: exhaustive flip to all categories
+                    flipped_versions, orig_cats = create_flipped_data_multiclass_exhaustive(
+                        X_test, self.sensitive_col_indices
+                    )
+                    # Get predictions for each flipped version
+                    y_preds_flipped = [model.predict(X_flip) for X_flip in flipped_versions]
+                    consistency = counterfactual_consistency_multiclass_exhaustive(
+                        y_pred, y_preds_flipped, orig_cats
+                    )
+                else:
+                    # Binary: simple flip
+                    X_test_flipped = create_flipped_data(X_test, self.sensitive_col_idx)
+                    y_pred_flipped = model.predict(X_test_flipped)
+                    consistency = counterfactual_consistency(y_pred, y_pred_flipped)
+                
                 consistency_scores.append(consistency)
         
         # Return objectives (SMAC minimizes, so return 1 - score)
@@ -581,13 +615,27 @@ def run_optimization(
     
     # Create appropriate pipeline based on approach
     if approach == 1:
-        # Approach 1: With sensitive features
-        pipeline = FairnessPipeline(
-            model_type=model_type,
-            X=data['X_train'],
-            y=data['y_train'],
-            sensitive_col_idx=data['sensitive_col_idx'],
-        )
+        # Approach 1: With sensitive features (binary or multiclass)
+        is_multiclass = data.get('is_multiclass', False)
+        
+        if is_multiclass:
+            print(f"Using MULTICLASS counterfactual (exhaustive, {len(data['sensitive_col_indices'])} categories)")
+            pipeline = FairnessPipeline(
+                model_type=model_type,
+                X=data['X_train'],
+                y=data['y_train'],
+                sensitive_col_indices=data['sensitive_col_indices'],
+                is_multiclass=True,
+            )
+        else:
+            print(f"Using BINARY counterfactual (single column flip)")
+            pipeline = FairnessPipeline(
+                model_type=model_type,
+                X=data['X_train'],
+                y=data['y_train'],
+                sensitive_col_idx=data['sensitive_col_idx'],
+                is_multiclass=False,
+            )
     else:
         # Approach 2: Without sensitive features
         if model_type == "sensei":
@@ -735,8 +783,13 @@ def plot_pareto_comparison(
     """
     Plot Pareto fronts for multiple models.
     
-    Shows all evaluated configurations (non-Pareto in gray, not connected)
-    and Pareto-optimal configurations (highlighted, connected with line).
+    Creates a figure with:
+    - Top row: 1×N individual subplots for each model
+    - Bottom row: Combined plot with all models overlaid
+    
+    Shows Accuracy (x-axis) and Consistency (y-axis) instead of error/inconsistency.
+    Non-Pareto points use lighter versions of the same color.
+    Pareto frontier points are connected with dashed lines.
     
     Parameters
     ----------
@@ -745,55 +798,118 @@ def plot_pareto_comparison(
     output_path : str
         Path to save the plot
     """
+    import matplotlib.colors as mcolors
+    
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     
-    fig, ax = plt.subplots(figsize=(10, 7))
+    n_models = len(results)
+    model_names = list(results.keys())
     
-    colors = {'rf': 'blue', 'mlp': 'orange'}
-    markers = {'rf': 'o', 'mlp': 's'}
+    # Define colors and their lighter versions for each model
+    base_colors = {'rf': '#1f77b4', 'mlp': '#ff7f0e', 'sensei': '#2ca02c'}  # Blue, Orange, Green
+    markers = {'rf': 'o', 'mlp': 's', 'sensei': '^'}
     
-    for model_type, smac in results.items():
-        # Get Pareto indices and all costs using helper function
+    def get_light_color(hex_color, factor=0.3):
+        """Create a lighter version of a color by blending with white."""
+        rgb = mcolors.to_rgb(hex_color)
+        light_rgb = tuple(1 - factor * (1 - c) for c in rgb)
+        return light_rgb
+    
+    # Create figure: top row for individual plots, bottom row for combined
+    fig = plt.figure(figsize=(5 * n_models, 10))
+    
+    # Create grid: top row has n_models columns, bottom row spans all
+    gs = fig.add_gridspec(2, n_models, height_ratios=[1, 1.2], hspace=0.25, wspace=0.3)
+    
+    # Top row: Individual plots
+    individual_axes = [fig.add_subplot(gs[0, i]) for i in range(n_models)]
+    
+    # Bottom row: Combined plot spanning all columns
+    combined_ax = fig.add_subplot(gs[1, :])
+    
+    def plot_model_data(ax, model_type, smac, show_legend=True, title=None):
+        """Plot data for a single model on the given axis."""
+        color = base_colors.get(model_type, '#7f7f7f')
+        light_color = get_light_color(color)
+        marker = markers.get(model_type, 'o')
+        
+        # Get Pareto indices and all costs
         pareto_indices, all_costs = get_pareto_indices(smac)
         
-        # Separate Pareto and non-Pareto costs using indices
+        # Separate Pareto and non-Pareto costs
         non_pareto_indices = np.setdiff1d(np.arange(len(all_costs)), pareto_indices)
         
-        # Get Pareto costs (sorted, same as get_pareto_front returns)
+        # Get Pareto costs (sorted)
         pareto_configs, pareto_costs = get_pareto_front(smac)
         
-        # Plot NON-PARETO configurations (dominated, gray color, NO line connection)
+        # Convert from (error, inconsistency) to (accuracy, consistency)
+        # accuracy = 1 - error, consistency = 1 - inconsistency
+        
+        # Plot NON-PARETO configurations (lighter color, same marker)
         if len(non_pareto_indices) > 0:
             non_pareto_costs = all_costs[non_pareto_indices]
+            non_pareto_accuracy = 1 - non_pareto_costs[:, 0]
+            non_pareto_consistency = 1 - non_pareto_costs[:, 1]
             ax.scatter(
-                non_pareto_costs[:, 0], non_pareto_costs[:, 1],
-                c='lightgray', marker=markers[model_type],
-                alpha=0.4, s=40, edgecolors='gray', linewidths=0.5,
-                label=f'{model_type.upper()} (dominated)',
-                zorder=1  # Behind Pareto points
+                non_pareto_accuracy, non_pareto_consistency,
+                c=[light_color], marker=marker,
+                alpha=0.6, s=50, edgecolors=color, linewidths=0.8,
+                label=f'{model_type.upper()} (dominated)' if show_legend else None,
+                zorder=1
             )
         
-        # Plot PARETO FRONT (optimal, bold color, connected with line)
+        # Plot PARETO FRONT (bold color, connected with dashed line)
         if len(pareto_costs) > 0:
+            pareto_accuracy = 1 - pareto_costs[:, 0]
+            pareto_consistency = 1 - pareto_costs[:, 1]
+            
+            # Sort by accuracy for proper line connection
+            sort_idx = np.argsort(pareto_accuracy)
+            pareto_accuracy_sorted = pareto_accuracy[sort_idx]
+            pareto_consistency_sorted = pareto_consistency[sort_idx]
+            
+            # Connect Pareto points with dashed line first (behind markers)
+            ax.plot(pareto_accuracy_sorted, pareto_consistency_sorted, 
+                    c=color, linestyle='--', linewidth=2.5, 
+                    alpha=0.9, zorder=2)
+            
+            # Plot Pareto markers on top
             ax.scatter(
-                pareto_costs[:, 0], pareto_costs[:, 1],
-                c=colors[model_type], marker=markers[model_type],
-                s=120, edgecolors='black', linewidths=2.5,
-                label=f'{model_type.upper()} (Pareto Front)',
-                zorder=3  # On top
+                pareto_accuracy, pareto_consistency,
+                c=color, marker=marker,
+                s=130, edgecolors='black', linewidths=2,
+                label=f'{model_type.upper()} (Pareto Front)' if show_legend else None,
+                zorder=3
             )
-            # Connect Pareto points with dashed line (ONLY frontier is connected)
-            ax.plot(pareto_costs[:, 0], pareto_costs[:, 1], 
-                     c=colors[model_type], linestyle='--', linewidth=2, 
-                     alpha=0.8, zorder=2)
+        
+        ax.set_xlabel('Balanced Accuracy', fontsize=11)
+        ax.set_ylabel('Counterfactual Consistency', fontsize=11)
+        ax.grid(True, alpha=0.3)
+        
+        if title:
+            ax.set_title(title, fontsize=12, fontweight='bold')
+        
+        if show_legend:
+            ax.legend(loc='lower left', fontsize=9)
     
-    ax.set_xlabel('Error (1 - Balanced Accuracy)', fontsize=12)
-    ax.set_ylabel('Inconsistency (1 - Counterfactual Consistency)', fontsize=12)
-    ax.set_title('Pareto Front Comparison: RF vs MLP\n(Gray = Dominated, Colored = Pareto Optimal)', fontsize=14, fontweight='bold')
-    ax.legend(loc='best', fontsize=10)
-    ax.grid(True, alpha=0.3)
+    # Plot individual models on top row
+    for i, model_type in enumerate(model_names):
+        smac = results[model_type]
+        plot_model_data(
+            individual_axes[i], 
+            model_type, 
+            smac, 
+            show_legend=True,
+            title=f'{model_type.upper()} Pareto Front'
+        )
     
-    plt.tight_layout()
+    # Plot all models combined on bottom row
+    for model_type, smac in results.items():
+        plot_model_data(combined_ax, model_type, smac, show_legend=True)
+    
+    combined_ax.set_title('Combined Pareto Front Comparison', fontsize=14, fontweight='bold')
+    combined_ax.legend(loc='lower left', fontsize=10, ncol=2)
+    
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
     
