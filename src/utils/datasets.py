@@ -26,6 +26,10 @@ class DatasetConfig:
     # Sensitive features available for fairness analysis
     sensitive_features: Dict[str, str]  # {feature_name: one_hot_column_to_keep}
     
+    # Proxy features for counterfactual evaluation (Approach 2)
+    # Maps proxy_name -> column_name (for flipping when sensitive features are removed)
+    proxy_features: Dict[str, str] = field(default_factory=dict)
+    
     # Columns to drop before preprocessing
     columns_to_drop: List[str] = field(default_factory=list)
     
@@ -51,6 +55,11 @@ DATASET_CONFIGS: Dict[str, DatasetConfig] = {
         sensitive_features={
             "sex": "sex_Male",      # Binary: Male=1, Female=0
             "race": "race_White",   # Binary: White=1, Other=0
+        },
+        # Proxy features for Approach 2 (used when sensitive features are removed)
+        # relationship_Wife is a strong proxy for sex (Wife implies Female)
+        proxy_features={
+            "relationship": "relationship_Wife",  # Flip this for counterfactual when sex is removed
         },
         columns_to_drop=["fnlwgt", "education"],  # fnlwgt=weight, education redundant with education-num
         drop_prefixes_after_encoding=["native-country_"],  # Too many categories
@@ -100,50 +109,109 @@ def get_dataset_config(dataset_name: str) -> DatasetConfig:
 
 
 # =============================================================================
-# Dataset Loading
+# Dataset Loading (Unified for Both Approaches)
 # =============================================================================
 
 def load_dataset(
     dataset_name: str,
-    sensitive_feature: str,
+    sensitive_feature: str = "sex",
+    approach: int = 1,
+    # Approach 2 specific parameters
+    remove_sensitive: bool = False,
+    sensitive_features_to_remove: Optional[List[str]] = None,
+    proxy_feature: Optional[str] = None,
     random_state: int = 42,
 ) -> Dict:
     """
     Load and preprocess a dataset from OpenML.
     
-    Note: Returns all data as training data. Cross-validation is used
-    during SMAC optimization, so no separate test set is needed.
+    Supports two approaches:
+    - Approach 1: Keep sensitive features in training, flip them for counterfactual
+    - Approach 2: Remove sensitive features from training, use proxy for counterfactual
     
     Parameters
     ----------
     dataset_name : str
         Name of dataset (e.g., "adult", "german_credit")
     sensitive_feature : str
-        Which sensitive feature to use for counterfactual evaluation
+        Which sensitive feature to use (Approach 1) or primary sensitive feature (Approach 2)
+    approach : int
+        1 = keep sensitive features, 2 = remove sensitive features
+    remove_sensitive : bool
+        If True, remove sensitive features from training (alternative to approach=2)
+    sensitive_features_to_remove : list, optional
+        For Approach 2: list of sensitive features to remove (default: all)
+    proxy_feature : str, optional
+        For Approach 2: proxy feature for counterfactual (e.g., "relationship")
     random_state : int
         Random seed for reproducibility
         
     Returns
     -------
     dict with keys:
-        - X_train: Feature matrix (numpy array) - all data
-        - y_train: Target labels - all data
-        - feature_names: List of feature names after preprocessing
+        Common:
+        - X_train: Feature matrix (numpy array)
+        - y_train: Target labels
+        - feature_names: List of feature names
+        - config: DatasetConfig used
+        - scaler: StandardScaler used
+        - approach: Which approach was used (1 or 2)
+        
+        Approach 1 specific:
         - sensitive_col_idx: Index of sensitive column to flip
         - sensitive_col_name: Name of sensitive column
-        - config: DatasetConfig used
+        
+        Approach 2 specific:
+        - X_protected: Sensitive features (for SenSeI distance metric)
+        - protected_feature_names: Names of protected features
+        - proxy_col_idx: Index of proxy column for counterfactual
+        - proxy_col_name: Name of proxy column
     """
+    # Handle approach parameter (remove_sensitive is a convenience alias)
+    if remove_sensitive:
+        approach = 2
+    
     config = get_dataset_config(dataset_name)
     
-    # Validate sensitive feature
-    if sensitive_feature not in config.sensitive_features:
-        available = list(config.sensitive_features.keys())
-        raise ValueError(
-            f"Invalid sensitive feature '{sensitive_feature}' for {dataset_name}. "
-            f"Available: {available}"
-        )
+    # Validate inputs based on approach
+    if approach == 1:
+        if sensitive_feature not in config.sensitive_features:
+            available = list(config.sensitive_features.keys())
+            raise ValueError(
+                f"Invalid sensitive feature '{sensitive_feature}' for {dataset_name}. "
+                f"Available: {available}"
+            )
+    else:  # Approach 2
+        # Default to removing all sensitive features
+        if sensitive_features_to_remove is None:
+            sensitive_features_to_remove = list(config.sensitive_features.keys())
+        
+        # Default proxy feature
+        if proxy_feature is None:
+            if config.proxy_features:
+                proxy_feature = list(config.proxy_features.keys())[0]
+            else:
+                raise ValueError(
+                    f"No proxy features configured for {dataset_name}. "
+                    f"Please specify proxy_feature parameter."
+                )
+        
+        if proxy_feature not in config.proxy_features:
+            available = list(config.proxy_features.keys())
+            raise ValueError(
+                f"Invalid proxy feature '{proxy_feature}' for {dataset_name}. "
+                f"Available: {available}"
+            )
     
+    # Print loading info
     print(f"Loading {config.name} from OpenML (ID: {config.openml_id})...")
+    if approach == 1:
+        print(f"APPROACH 1: Keeping sensitive features in training")
+        print(f"  Sensitive feature for counterfactual: {sensitive_feature}")
+    else:
+        print(f"APPROACH 2: Removing sensitive features from training")
+        print(f"  Sensitive features to remove: {sensitive_features_to_remove}")
+        print(f"  Proxy feature for counterfactual: {proxy_feature}")
     
     # Load from OpenML
     dataset = openml.datasets.get_dataset(config.openml_id)
@@ -155,7 +223,6 @@ def load_dataset(
     if config.target_positive_class is not None:
         y = (y_series == config.target_positive_class).astype(int).values
     else:
-        # Assume already numeric
         y = y_series.astype(int).values
     
     print(f"Original features: {list(X_df.columns)}")
@@ -181,75 +248,124 @@ def load_dataset(
         )
     
     # Dataset-specific preprocessing
-    if dataset_name == "german_credit" and sensitive_feature == "personal_status":
-        # Create binary gender from personal_status
+    if dataset_name == "german_credit" and (
+        sensitive_feature == "personal_status" or 
+        (approach == 2 and "personal_status" in (sensitive_features_to_remove or []))
+    ):
         X_df = _preprocess_german_credit_gender(X_df)
-        # Remove personal_status from categorical cols (we've replaced it)
         categorical_cols = [c for c in categorical_cols if c != "personal_status"]
     
     # One-hot encode categorical features
     X_encoded = pd.get_dummies(X_df, columns=categorical_cols, drop_first=False)
     
-    # Get the sensitive column name to keep
-    sensitive_col_name = config.sensitive_features[sensitive_feature]
-    
-    # Determine columns to drop after encoding
-    cols_to_drop_encoded = []
-    
-    # Drop other columns from the same sensitive feature group
-    if sensitive_feature == "sex":
-        cols_to_drop_encoded += [c for c in X_encoded.columns 
-                                  if c.startswith('sex_') and c != sensitive_col_name]
-    elif sensitive_feature == "race":
-        cols_to_drop_encoded += [c for c in X_encoded.columns 
-                                  if c.startswith('race_') and c != sensitive_col_name]
-    elif sensitive_feature == "personal_status":
-        # For German Credit, we created a binary column already
-        cols_to_drop_encoded += [c for c in X_encoded.columns 
-                                  if c.startswith('personal_status_') and c != sensitive_col_name]
-    
-    # Drop columns with specified prefixes
+    # Drop columns with specified prefixes (e.g., native-country_)
+    cols_to_drop_prefixes = []
     for prefix in config.drop_prefixes_after_encoding:
-        cols_to_drop_encoded += [c for c in X_encoded.columns if c.startswith(prefix)]
+        cols_to_drop_prefixes += [c for c in X_encoded.columns if c.startswith(prefix)]
+    X_encoded = X_encoded.drop(columns=cols_to_drop_prefixes, errors='ignore')
     
-    X_encoded = X_encoded.drop(columns=[c for c in cols_to_drop_encoded if c in X_encoded.columns])
+    # =========================================================================
+    # Approach-specific processing
+    # =========================================================================
     
-    # Get final feature names
-    feature_names_final = list(X_encoded.columns)
-    print(f"\nFinal features ({len(feature_names_final)}): {feature_names_final}")
+    if approach == 1:
+        # APPROACH 1: Keep sensitive feature, drop other related columns
+        sensitive_col_name = config.sensitive_features[sensitive_feature]
+        
+        cols_to_drop_encoded = []
+        if sensitive_feature == "sex":
+            cols_to_drop_encoded += [c for c in X_encoded.columns 
+                                      if c.startswith('sex_') and c != sensitive_col_name]
+        elif sensitive_feature == "race":
+            cols_to_drop_encoded += [c for c in X_encoded.columns 
+                                      if c.startswith('race_') and c != sensitive_col_name]
+        elif sensitive_feature == "personal_status":
+            cols_to_drop_encoded += [c for c in X_encoded.columns 
+                                      if c.startswith('personal_status_') and c != sensitive_col_name]
+        
+        X_encoded = X_encoded.drop(columns=cols_to_drop_encoded, errors='ignore')
+        feature_names_final = list(X_encoded.columns)
+        
+        # Find sensitive column index
+        if sensitive_col_name not in feature_names_final:
+            raise ValueError(f"Sensitive column '{sensitive_col_name}' not found.")
+        sensitive_col_idx = feature_names_final.index(sensitive_col_name)
+        
+        print(f"\nSensitive feature: {sensitive_col_name} (index {sensitive_col_idx})")
+        
+    else:
+        # APPROACH 2: Remove sensitive features, keep proxy
+        protected_cols = []
+        cols_to_remove = []
+        
+        for sens_feat in sensitive_features_to_remove:
+            if sens_feat in config.sensitive_features:
+                sens_col = config.sensitive_features[sens_feat]
+                if sens_col in X_encoded.columns:
+                    protected_cols.append(sens_col)
+                    cols_to_remove.append(sens_col)
+                
+                # Also remove other one-hot columns from same feature
+                prefix = sens_feat + "_"
+                for col in X_encoded.columns:
+                    if col.startswith(prefix) and col not in cols_to_remove:
+                        cols_to_remove.append(col)
+        
+        # Extract protected features BEFORE removing
+        X_protected = X_encoded[protected_cols].values.astype(np.float32) if protected_cols else None
+        protected_feature_names = protected_cols
+        
+        # Remove sensitive columns
+        X_encoded = X_encoded.drop(columns=cols_to_remove, errors='ignore')
+        feature_names_final = list(X_encoded.columns)
+        
+        # Find proxy column index
+        proxy_col_name = config.proxy_features[proxy_feature]
+        if proxy_col_name not in feature_names_final:
+            raise ValueError(f"Proxy column '{proxy_col_name}' not found.")
+        proxy_col_idx = feature_names_final.index(proxy_col_name)
+        
+        print(f"\nProtected features (for SenSeI): {protected_feature_names}")
+        print(f"Proxy column for counterfactual: {proxy_col_name} (index {proxy_col_idx})")
     
     # Convert to numpy
     X = X_encoded.values.astype(np.float32)
     
-    # Find sensitive column index
-    if sensitive_col_name not in feature_names_final:
-        raise ValueError(
-            f"Sensitive column '{sensitive_col_name}' not found in features. "
-            f"Available: {feature_names_final}"
-        )
-    sensitive_col_idx = feature_names_final.index(sensitive_col_name)
-    print(f"\nSensitive feature: {sensitive_col_name} (index {sensitive_col_idx})")
-    
-    # Standardize numerical columns (on all data - CV will handle splits)
+    # Standardize numerical columns
     numerical_idx = [feature_names_final.index(c) for c in numerical_cols if c in feature_names_final]
-    
     scaler = StandardScaler()
     if numerical_idx:
         X[:, numerical_idx] = scaler.fit_transform(X[:, numerical_idx])
     
-    print(f"\nDataset loaded:")
+    print(f"\nFinal features ({len(feature_names_final)}): {feature_names_final[:10]}...")
+    print(f"\nDataset loaded (Approach {approach}):")
     print(f"  Samples: {X.shape[0]}, Features: {X.shape[1]}")
     print(f"  Positive class ratio: {y.mean():.2%}")
     
-    return {
-        'X_train': X,  # All data - CV handles train/test splits
+    # Build result dictionary
+    result = {
+        'X_train': X,
         'y_train': y,
         'feature_names': feature_names_final,
-        'sensitive_col_idx': sensitive_col_idx,
-        'sensitive_col_name': sensitive_col_name,
         'scaler': scaler,
         'config': config,
+        'approach': approach,
     }
+    
+    if approach == 1:
+        result.update({
+            'sensitive_col_idx': sensitive_col_idx,
+            'sensitive_col_name': sensitive_col_name,
+        })
+    else:
+        result.update({
+            'X_protected': X_protected,
+            'protected_feature_names': protected_feature_names,
+            'proxy_col_idx': proxy_col_idx,
+            'proxy_col_name': proxy_col_name,
+        })
+    
+    return result
 
 
 # =============================================================================
