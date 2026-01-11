@@ -165,3 +165,6 @@ results/
 temp/
 .smac3_output
 smac3_output/
+
+# Ignore ablation_results output on this machine (do not include in repo)
+ablation_results/

@@ -30,6 +30,10 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.base import clone
+from sklearn.manifold import MDS
+from sklearn.preprocessing import MinMaxScaler
+import matplotlib.cm as cm
+from matplotlib.colors import Normalize
 
 from smac import HyperparameterOptimizationFacade as HPOFacade
 from smac import Scenario
@@ -154,7 +158,7 @@ class FairnessPipeline:
         # Pre-compute CV splits for consistency
         cv = StratifiedKFold(n_splits=n_cv_splits, shuffle=True, random_state=42)
         self.cv_splits = list(cv.split(X, y))
-    
+
     @property
     def configspace(self) -> ConfigurationSpace:
         if self.model_type == "rf":
@@ -182,10 +186,10 @@ class FairnessPipeline:
         """
         accuracy_scores = []
         consistency_scores = []
-        
+
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore")
-            
+
             for train_idx, test_idx in self.cv_splits:
                 # Split data
                 X_train, X_test = self.X[train_idx], self.X[test_idx]
@@ -239,7 +243,7 @@ def run_optimization(
         Maximum number of configurations to try
     output_dir : str
         Directory to save SMAC output
-        
+
     Returns
     -------
     smac : AbstractFacade
@@ -268,11 +272,11 @@ def run_optimization(
         n_workers=1,
         output_directory=os.path.join(output_dir, model_type),
     )
-    
+
     # Create SMAC
     initial_design = HPOFacade.get_initial_design(scenario, n_configs=5)
     multi_objective_algorithm = ParEGO(scenario)
-    
+
     smac = HPOFacade(
         scenario,
         pipeline.train,
@@ -280,10 +284,10 @@ def run_optimization(
         multi_objective_algorithm=multi_objective_algorithm,
         overwrite=True,
     )
-    
+
     # Optimize
     incumbents = smac.optimize()
-    
+
     # Print results
     print(f"\nOptimization complete for {model_type.upper()}")
     print(f"Number of configurations evaluated: {len(smac.runhistory.get_configs())}")
@@ -385,7 +389,7 @@ def plot_pareto_comparison(
     """
     Plot Pareto fronts for multiple models.
     
-    Shows all evaluated configurations (non-Pareto in different color, not connected)
+    Shows all evaluated configurations (non-Pareto in gray, not connected)
     and Pareto-optimal configurations (highlighted, connected with line).
     
     Parameters
@@ -397,13 +401,10 @@ def plot_pareto_comparison(
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig, ax = plt.subplots(figsize=(10, 7))
     
     colors = {'rf': 'blue', 'mlp': 'orange'}
     markers = {'rf': 'o', 'mlp': 's'}
-    
-    # Plot 1: All points with Pareto fronts (cost space)
-    ax1 = axes[0]
     
     for model_type, smac in results.items():
         # Get Pareto indices and all costs using helper function
@@ -418,17 +419,17 @@ def plot_pareto_comparison(
         # Plot NON-PARETO configurations (dominated, gray color, NO line connection)
         if len(non_pareto_indices) > 0:
             non_pareto_costs = all_costs[non_pareto_indices]
-            ax1.scatter(
+            ax.scatter(
                 non_pareto_costs[:, 0], non_pareto_costs[:, 1],
                 c='lightgray', marker=markers[model_type],
                 alpha=0.4, s=40, edgecolors='gray', linewidths=0.5,
-                label=f'{model_type.upper()} (non-Pareto, dominated)' if model_type == 'rf' else '',
+                label=f'{model_type.upper()} (dominated)',
                 zorder=1  # Behind Pareto points
             )
         
         # Plot PARETO FRONT (optimal, bold color, connected with line)
         if len(pareto_costs) > 0:
-            ax1.scatter(
+            ax.scatter(
                 pareto_costs[:, 0], pareto_costs[:, 1],
                 c=colors[model_type], marker=markers[model_type],
                 s=120, edgecolors='black', linewidths=2.5,
@@ -436,66 +437,15 @@ def plot_pareto_comparison(
                 zorder=3  # On top
             )
             # Connect Pareto points with dashed line (ONLY frontier is connected)
-            ax1.plot(pareto_costs[:, 0], pareto_costs[:, 1], 
+            ax.plot(pareto_costs[:, 0], pareto_costs[:, 1], 
                      c=colors[model_type], linestyle='--', linewidth=2, 
                      alpha=0.8, zorder=2)
     
-    ax1.set_xlabel('Error (1 - Balanced Accuracy)', fontsize=12)
-    ax1.set_ylabel('Inconsistency (1 - Counterfactual Consistency)', fontsize=12)
-    ax1.set_title('All Configurations vs Pareto Front\n(Gray = Dominated, Colored = Pareto Optimal)', fontsize=14, fontweight='bold')
-    ax1.legend(loc='best', fontsize=10)
-    ax1.grid(True, alpha=0.3)
-    
-    # Plot 2: All points with Pareto fronts (score space - higher = better)
-    ax2 = axes[1]
-    
-    for model_type, smac in results.items():
-        # Get Pareto indices and all costs using helper function
-        pareto_indices, all_costs = get_pareto_indices(smac)
-        
-        # Separate Pareto and non-Pareto costs using indices
-        non_pareto_indices = np.setdiff1d(np.arange(len(all_costs)), pareto_indices)
-        
-        # Get Pareto costs (sorted, same as get_pareto_front returns)
-        pareto_configs, pareto_costs = get_pareto_front(smac)
-        
-        # Convert all costs to scores (accuracy, consistency)
-        all_scores = 1 - all_costs
-        pareto_scores = 1 - pareto_costs
-        
-        # Plot NON-PARETO configurations (dominated, gray, NO line connection)
-        if len(non_pareto_indices) > 0:
-            non_pareto_scores = all_scores[non_pareto_indices]
-            ax2.scatter(
-                non_pareto_scores[:, 0], non_pareto_scores[:, 1],
-                c='lightgray', marker=markers[model_type],
-                alpha=0.4, s=40, edgecolors='gray', linewidths=0.5,
-                label=f'{model_type.upper()} (non-Pareto, dominated)' if model_type == 'rf' else '',
-                zorder=1  # Behind Pareto points
-            )
-        
-        # Plot PARETO FRONT (optimal, bold color, connected with line)
-        if len(pareto_scores) > 0:
-            accuracy = pareto_scores[:, 0]
-            consistency = pareto_scores[:, 1]
-            
-            ax2.scatter(
-                accuracy, consistency,
-                c=colors[model_type], marker=markers[model_type],
-                s=120, edgecolors='black', linewidths=2.5,
-                label=f'{model_type.upper()} (Pareto Front)',
-                zorder=3  # On top
-            )
-            # Connect Pareto points with dashed line (ONLY frontier is connected)
-            ax2.plot(accuracy, consistency, 
-                     c=colors[model_type], linestyle='--', linewidth=2,
-                     alpha=0.8, zorder=2)
-    
-    ax2.set_xlabel('Balanced Accuracy', fontsize=12)
-    ax2.set_ylabel('Counterfactual Consistency', fontsize=12)
-    ax2.set_title('All Configurations vs Pareto Front (Higher = Better)\n(Gray = Dominated, Colored = Pareto Optimal)', fontsize=14, fontweight='bold')
-    ax2.legend(loc='best', fontsize=10)
-    ax2.grid(True, alpha=0.3)
+    ax.set_xlabel('Error (1 - Balanced Accuracy)', fontsize=12)
+    ax.set_ylabel('Inconsistency (1 - Counterfactual Consistency)', fontsize=12)
+    ax.set_title('Pareto Front Comparison: RF vs MLP\n(Gray = Dominated, Colored = Pareto Optimal)', fontsize=14, fontweight='bold')
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
@@ -529,6 +479,364 @@ def print_pareto_summary(results: Dict[str, AbstractFacade]):
         # Best consistency
         best_cons_idx = np.argmin(costs[:, 1])
         print(f"  Best Consistency: {1-costs[best_cons_idx, 1]:.4f} (Accuracy: {1-costs[best_cons_idx, 0]:.4f})")
+
+
+# =============================================================================
+# Advanced Visualizations (Parallel Coordinates & MDS)
+# =============================================================================
+
+def extract_config_data(smac: AbstractFacade, model_type: str) -> tuple:
+    """
+    Extract hyperparameter values and costs from SMAC runhistory.
+    
+    Returns
+    -------
+    hp_names : list
+        Hyperparameter names
+    hp_values : np.ndarray
+        Hyperparameter values for each config (n_configs x n_hyperparams)
+    costs : np.ndarray
+        Costs for each config (n_configs x 2)
+    pareto_mask : np.ndarray
+        Boolean mask indicating Pareto-optimal configs
+    """
+    configs = smac.runhistory.get_configs()
+    
+    # Get hyperparameter names from first config
+    hp_names = list(configs[0].keys())
+    
+    # Extract hyperparameter values
+    hp_values = []
+    for config in configs:
+        values = []
+        for hp_name in hp_names:
+            val = config[hp_name]
+            # Convert categorical to numeric
+            if isinstance(val, str):
+                # Get all possible values for this hyperparameter
+                cs = get_rf_configspace() if model_type == "rf" else get_mlp_configspace()
+                hp = cs.get_hyperparameter(hp_name)
+                if hasattr(hp, 'choices'):
+                    choices = list(hp.choices)
+                    val = choices.index(val) if val in choices else 0
+            elif val is None:
+                val = 0
+            values.append(float(val))
+        hp_values.append(values)
+    
+    hp_values = np.array(hp_values)
+    
+    # Get costs
+    costs = np.array([smac.runhistory.average_cost(config) for config in configs])
+    
+    # Get Pareto mask
+    pareto_indices, _ = get_pareto_indices(smac)
+    pareto_mask = np.zeros(len(configs), dtype=bool)
+    pareto_mask[pareto_indices] = True
+    
+    return hp_names, hp_values, costs, pareto_mask
+
+
+def plot_parallel_coordinates(
+    smac: AbstractFacade,
+    model_type: str,
+    output_path: str,
+    color_by: str = "error",  # "error", "inconsistency", or "pareto"
+):
+    """
+    Create a parallel coordinate plot of hyperparameters and objectives.
+    
+    Similar to slide 1 - each vertical axis is a hyperparameter,
+    each line is a configuration, color indicates performance.
+    Categorical hyperparameters show their actual category names.
+    
+    Parameters
+    ----------
+    smac : AbstractFacade
+        SMAC optimizer with results
+    model_type : str
+        "rf" or "mlp"
+    output_path : str
+        Path to save the plot
+    color_by : str
+        What to color lines by: "error", "inconsistency", or "pareto"
+    """
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    
+    # Extract data
+    hp_names, hp_values, costs, pareto_mask = extract_config_data(smac, model_type)
+    
+    # Get config space to identify categorical hyperparameters
+    cs = get_rf_configspace() if model_type == "rf" else get_mlp_configspace()
+    
+    # Build categorical info: {hp_name: [category_names]} or None for numerical
+    categorical_info = {}
+    for hp_name in hp_names:
+        hp = cs.get_hyperparameter(hp_name)
+        if hasattr(hp, 'choices'):
+            categorical_info[hp_name] = list(hp.choices)
+        else:
+            categorical_info[hp_name] = None
+    
+    # Normalize hyperparameter values to [0, 1] for plotting
+    scaler = MinMaxScaler()
+    hp_values_norm = scaler.fit_transform(hp_values)
+    
+    # Add objectives as the first two axes
+    # Convert to scores (higher = better) for intuitive interpretation
+    accuracy = 1 - costs[:, 0]
+    consistency = 1 - costs[:, 1]
+    
+    # Normalize objectives
+    acc_norm = (accuracy - accuracy.min()) / (accuracy.max() - accuracy.min() + 1e-10)
+    cons_norm = (consistency - consistency.min()) / (consistency.max() - consistency.min() + 1e-10)
+    
+    # Combine: [accuracy, consistency, hp1, hp2, ...]
+    all_values = np.column_stack([acc_norm, cons_norm, hp_values_norm])
+    all_names = ["Accuracy", "Consistency"] + hp_names
+    
+    # Create figure with more height for annotations
+    fig, ax = plt.subplots(figsize=(16, 7))
+    
+    # Set up colors based on color_by
+    if color_by == "error":
+        color_values = costs[:, 0]
+        cmap = cm.RdYlGn_r  # Red = high error, Green = low error
+        cbar_label = "Error (1 - Accuracy)"
+    elif color_by == "inconsistency":
+        color_values = costs[:, 1]
+        cmap = cm.RdYlGn_r
+        cbar_label = "Inconsistency (1 - Consistency)"
+    else:  # pareto
+        color_values = pareto_mask.astype(float)
+        cmap = cm.coolwarm
+        cbar_label = "Pareto Optimal"
+    
+    norm = Normalize(vmin=color_values.min(), vmax=color_values.max())
+    
+    # Plot each configuration as a line
+    x_positions = np.arange(len(all_names))
+    
+    # Sort by color value so best configs are drawn on top
+    sort_idx = np.argsort(color_values)[::-1]  # Worst first, best on top
+    
+    for idx in sort_idx:
+        color = cmap(norm(color_values[idx]))
+        alpha = 0.8 if pareto_mask[idx] else 0.3
+        linewidth = 2.5 if pareto_mask[idx] else 1.0
+        zorder = 10 if pareto_mask[idx] else 1
+        
+        ax.plot(x_positions, all_values[idx], 
+                color=color, alpha=alpha, linewidth=linewidth, zorder=zorder)
+    
+    # Draw vertical axes and add labels for categorical variables
+    for i, name in enumerate(all_names):
+        ax.axvline(x=i, color='black', linewidth=1.5, alpha=0.7)
+        
+        # Add category labels for categorical hyperparameters
+        if name in categorical_info and categorical_info[name] is not None:
+            categories = categorical_info[name]
+            n_categories = len(categories)
+            
+            # Position categories evenly along the axis
+            for j, cat_name in enumerate(categories):
+                y_pos = j / (n_categories - 1) if n_categories > 1 else 0.5
+                # Add label to the right of the axis
+                ax.annotate(
+                    str(cat_name)[:8],  # Truncate long names
+                    xy=(i + 0.05, y_pos),
+                    fontsize=7,
+                    color='darkblue',
+                    alpha=0.8,
+                    va='center'
+                )
+    
+    # Set axis labels
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(all_names, rotation=45, ha='right', fontsize=10)
+    ax.set_ylabel('Normalized Value', fontsize=12)
+    ax.set_title(f'Parallel Coordinate Plot - {model_type.upper()}\n'
+                 f'(Bold lines = Pareto optimal, Faint = Dominated)', 
+                 fontsize=14, fontweight='bold')
+    
+    # Add colorbar
+    sm = cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, shrink=0.8)
+    cbar.set_label(cbar_label, fontsize=11)
+    
+    # Add scale labels on the sides
+    ax.set_ylim(-0.08, 1.08)
+    ax.set_yticks([0, 0.5, 1])
+    ax.set_yticklabels(['Min', 'Mid', 'Max'])
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Parallel coordinate plot saved to: {output_path}")
+
+
+def plot_mds_projection(
+    smac: AbstractFacade,
+    model_type: str,
+    output_path: str,
+):
+    """
+    Create MDS projection of hyperparameter configurations to 2D.
+    
+    Similar to slide 2 - projects high-dimensional hyperparameter space
+    to 2D, with background colored by interpolated performance surface,
+    and Pareto points highlighted.
+    
+    Parameters
+    ----------
+    smac : AbstractFacade
+        SMAC optimizer with results
+    model_type : str
+        "rf" or "mlp"
+    output_path : str
+        Path to save the plot
+    """
+    from scipy.interpolate import RBFInterpolator
+    
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    
+    # Extract data
+    hp_names, hp_values, costs, pareto_mask = extract_config_data(smac, model_type)
+    
+    # Normalize hyperparameter values
+    scaler = MinMaxScaler()
+    hp_values_norm = scaler.fit_transform(hp_values)
+    
+    # Apply MDS to project to 2D
+    n_configs = len(hp_values_norm)
+    if n_configs < 3:
+        print(f"Warning: Not enough configurations ({n_configs}) for MDS projection")
+        return
+    
+    mds = MDS(n_components=2, random_state=42, dissimilarity='euclidean', normalized_stress='auto')
+    coords_2d = mds.fit_transform(hp_values_norm)
+    
+    # Create grid for background interpolation
+    margin = 0.1
+    x_min, x_max = coords_2d[:, 0].min() - margin, coords_2d[:, 0].max() + margin
+    y_min, y_max = coords_2d[:, 1].min() - margin, coords_2d[:, 1].max() + margin
+    
+    grid_resolution = 100
+    xx, yy = np.meshgrid(
+        np.linspace(x_min, x_max, grid_resolution),
+        np.linspace(y_min, y_max, grid_resolution)
+    )
+    grid_points = np.column_stack([xx.ravel(), yy.ravel()])
+    
+    # Create figure with two subplots (colored by each objective)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    
+    objectives = [
+        ("Error", costs[:, 0], cm.YlOrRd),  # Yellow-Orange-Red for error
+        ("Inconsistency", costs[:, 1], cm.YlOrRd),
+    ]
+    
+    for ax, (obj_name, obj_values, cmap) in zip(axes, objectives):
+        # Interpolate performance surface using RBF
+        try:
+            rbf = RBFInterpolator(coords_2d, obj_values, kernel='thin_plate_spline', smoothing=0.1)
+            zz = rbf(grid_points).reshape(xx.shape)
+            
+            # Clip interpolated values to observed range
+            zz = np.clip(zz, obj_values.min(), obj_values.max())
+            
+            # Plot background heatmap
+            im = ax.pcolormesh(xx, yy, zz, cmap=cmap, alpha=0.7, shading='auto')
+            
+            # Add colorbar for background
+            cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+            cbar.set_label(f'Predicted {obj_name}', fontsize=10)
+        except Exception as e:
+            print(f"Warning: Could not create background interpolation: {e}")
+        
+        # Plot non-Pareto points
+        non_pareto = ~pareto_mask
+        if non_pareto.sum() > 0:
+            ax.scatter(
+                coords_2d[non_pareto, 0], coords_2d[non_pareto, 1],
+                c='white', s=60, alpha=0.9, edgecolors='gray', linewidths=1,
+                marker='o', label='Non-Pareto', zorder=5
+            )
+        
+        # Plot Pareto points on top (red squares like in the slide)
+        if pareto_mask.sum() > 0:
+            ax.scatter(
+                coords_2d[pareto_mask, 0], coords_2d[pareto_mask, 1],
+                c='red', s=120, edgecolors='black', linewidths=2,
+                marker='s', label='Pareto Optimal', zorder=10
+            )
+        
+        ax.set_xlabel('MDS-X', fontsize=11)
+        ax.set_ylabel('MDS-Y', fontsize=11)
+        ax.set_title(f'{model_type.upper()} - {obj_name}', fontsize=12, fontweight='bold')
+        ax.legend(loc='upper right', fontsize=9)
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
+    
+    plt.suptitle(f'MDS Projection of Hyperparameter Space - {model_type.upper()}\n'
+                 f'(Background = Interpolated Performance, Red Squares = Pareto Optimal)', 
+                 fontsize=13, fontweight='bold', y=1.02)
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"MDS projection plot saved to: {output_path}")
+
+
+def generate_all_visualizations(
+    results: Dict[str, AbstractFacade],
+    dataset_name: str,
+    sensitive_feature: str,
+    output_dir: str = "plots",
+):
+    """
+    Generate all visualizations for the experiment results.
+    
+    Parameters
+    ----------
+    results : dict
+        Dictionary mapping model_type -> smac optimizer
+    dataset_name : str
+        Name of the dataset
+    sensitive_feature : str
+        Name of the sensitive feature
+    output_dir : str
+        Directory to save plots
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    prefix = f"{dataset_name}_{sensitive_feature}"
+    
+    # 1. Pareto comparison plot
+    plot_pareto_comparison(
+        results, 
+        output_path=f"{output_dir}/pareto_{prefix}.png"
+    )
+    
+    # 2. Parallel coordinate plots for each model
+    for model_type, smac in results.items():
+        plot_parallel_coordinates(
+            smac, model_type,
+            output_path=f"{output_dir}/parallel_coords_{prefix}_{model_type}.png",
+            color_by="error"
+        )
+    
+    # 3. MDS projection plots for each model
+    for model_type, smac in results.items():
+        plot_mds_projection(
+            smac, model_type,
+            output_path=f"{output_dir}/mds_projection_{prefix}_{model_type}.png"
+        )
+    
+    print(f"\nAll visualizations saved to: {output_dir}/")
 
 
 # =============================================================================
@@ -583,11 +891,10 @@ def main(
         results[model_type] = smac
     
     # Plot and summarize results
-    output_path = f"plots/pareto_{dataset_name}_{sensitive_feature}.png"
-    plot_pareto_comparison(results, output_path=output_path)
+    generate_all_visualizations(results, dataset_name, sensitive_feature)
     print_pareto_summary(results)
     
-    return results
+    return results, data
 
 
 if __name__ == "__main__":
@@ -634,7 +941,7 @@ if __name__ == "__main__":
             print(f"  OpenML ID: {cfg.openml_id}")
             print(f"  Sensitive features: {list(cfg.sensitive_features.keys())}")
     else:
-        results = main(
+        results, data = main(
             dataset_name=args.dataset,
             sensitive_feature=args.sensitive,
             walltime_limit=args.walltime,
