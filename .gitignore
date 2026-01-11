@@ -168,3 +168,5 @@ smac3_output/
 
 # Ignore ablation_results output on this machine (do not include in repo)
 ablation_results/
+smac_output/
+plots/

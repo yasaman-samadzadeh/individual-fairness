@@ -1,10 +1,18 @@
 """
 Multi-Objective Fairness Optimization with SMAC
 
-Approach 1: Standard models with sensitive features included.
-Evaluate using counterfactual consistency on the sensitive feature directly.
+Two approaches for individual fairness evaluation:
 
-Models: RandomForest, MLP (separate SMAC runs for each)
+Approach 1: Standard models WITH sensitive features included.
+- Train RF/MLP with all features (including sex, race)
+- Evaluate counterfactual consistency by flipping sensitive features directly
+
+Approach 2: Standard models + SenSeI WITHOUT sensitive features.
+- Train RF/MLP/SenSeI without sensitive features
+- Use sensitive features only for SenSeI's fair distance metric
+- Evaluate counterfactual consistency on proxy features (e.g., relationship_Wife)
+
+Models: RandomForest, MLP, SenSeI (PyTorch neural network)
 Objectives: Accuracy (maximize) + Counterfactual Consistency (maximize)
 """
 
@@ -40,8 +48,25 @@ from smac import Scenario
 from smac.facade.abstract_facade import AbstractFacade
 from smac.multi_objective.parego import ParEGO
 
-from utils.datasets import load_dataset, create_flipped_data, list_available_datasets, get_dataset_config
+from utils.datasets import (
+    load_dataset, 
+    create_flipped_data, 
+    list_available_datasets, 
+    get_dataset_config
+)
 from utils.individual_fairness import counterfactual_consistency
+
+# Check if inFairness (SenSeI) is available
+try:
+    import torch
+    import torch.nn.functional as F
+    from inFairness.fairalgo import SenSeI
+    from inFairness.distances import LogisticRegSensitiveSubspace, SquaredEuclideanDistance
+    SENSEI_AVAILABLE = True
+except ImportError:
+    SENSEI_AVAILABLE = False
+    print("Warning: inFairness not installed. SenSeI model will not be available.")
+    print("Install with: pip install inFairness")
 
 
 # =============================================================================
@@ -218,6 +243,304 @@ class FairnessPipeline:
 
 
 # =============================================================================
+# Approach 2: Pipeline WITHOUT Sensitive Features
+# =============================================================================
+
+class FairnessPipelineApproach2:
+    """
+    Pipeline for Approach 2: Models trained WITHOUT sensitive features.
+    
+    Counterfactual consistency is evaluated on a proxy feature instead
+    of the sensitive feature directly.
+    """
+    
+    def __init__(
+        self,
+        model_type: str,
+        X: np.ndarray,
+        y: np.ndarray,
+        proxy_col_idx: int,  # Proxy column for counterfactual
+        n_cv_splits: int = 5,
+    ):
+        """
+        Parameters
+        ----------
+        model_type : str
+            "rf" for Random Forest, "mlp" for MLP
+        X : np.ndarray
+            Feature matrix (WITHOUT sensitive features)
+        y : np.ndarray
+            Target labels
+        proxy_col_idx : int
+            Index of proxy column for counterfactual (e.g., relationship_Wife)
+        n_cv_splits : int
+            Number of cross-validation splits
+        """
+        self.model_type = model_type
+        self.X = X
+        self.y = y
+        self.proxy_col_idx = proxy_col_idx
+        self.n_cv_splits = n_cv_splits
+        
+        # Pre-compute CV splits
+        cv = StratifiedKFold(n_splits=n_cv_splits, shuffle=True, random_state=42)
+        self.cv_splits = list(cv.split(X, y))
+
+    @property
+    def configspace(self) -> ConfigurationSpace:
+        if self.model_type == "rf":
+            return get_rf_configspace()
+        elif self.model_type == "mlp":
+            return get_mlp_configspace()
+        else:
+            raise ValueError(f"Unknown model type: {self.model_type}")
+    
+    def _create_model(self, config: Configuration):
+        if self.model_type == "rf":
+            return create_rf_model(config)
+        elif self.model_type == "mlp":
+            return create_mlp_model(config)
+    
+    def train(self, config: Configuration, seed: int = 0) -> Dict[str, float]:
+        """
+        Train and evaluate using proxy-based counterfactual consistency.
+        """
+        accuracy_scores = []
+        consistency_scores = []
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore")
+
+            for train_idx, test_idx in self.cv_splits:
+                X_train, X_test = self.X[train_idx], self.X[test_idx]
+                y_train, y_test = self.y[train_idx], self.y[test_idx]
+                
+                model = self._create_model(config)
+                model.fit(X_train, y_train)
+                
+                # Evaluate accuracy
+                y_pred = model.predict(X_test)
+                acc = balanced_accuracy_score(y_test, y_pred)
+                accuracy_scores.append(acc)
+                
+                # Evaluate counterfactual consistency on PROXY column
+                X_test_flipped = create_flipped_data(X_test, self.proxy_col_idx)
+                y_pred_flipped = model.predict(X_test_flipped)
+                consistency = counterfactual_consistency(y_pred, y_pred_flipped)
+                consistency_scores.append(consistency)
+        
+        return {
+            "error": 1.0 - np.mean(accuracy_scores),
+            "inconsistency": 1.0 - np.mean(consistency_scores),
+        }
+
+
+# =============================================================================
+# SenSeI Model (Individual Fairness In-Training)
+# =============================================================================
+
+def get_sensei_configspace() -> ConfigurationSpace:
+    """Configuration space for SenSeI neural network.
+    
+    Based on IBM's inFairness example parameters, optimized for faster training.
+    
+    Note: Reduced ranges compared to IBM defaults to make HPO tractable.
+    The auditor_nsteps is the main cost driver - reduced significantly.
+    """
+    cs = ConfigurationSpace(seed=42)
+    
+    cs.add_hyperparameters([
+        Integer("n_hidden_layers", (1, 2), default=2),       # Reduced from (1,3)
+        Integer("n_neurons", (50, 150), log=True, default=100),  # Narrowed range
+        Float("learning_rate", (5e-4, 5e-3), log=True, default=1e-3),  # Narrowed
+        Float("rho", (2.0, 15.0), log=True, default=5.0),    # Reduced from (1,25)
+        Float("eps", (0.05, 0.2), log=True, default=0.1),    # Narrowed
+        Integer("auditor_nsteps", (10, 30), default=20),     # REDUCED from (10,100)!
+        Float("auditor_lr", (1e-3, 5e-2), log=True, default=1e-2),  # Higher LR
+        Integer("batch_size", (64, 256), log=True, default=128),  # Larger batches
+        Integer("epochs", (3, 8), default=5),                # REDUCED from (5,20)!
+    ])
+    
+    return cs
+
+
+class SenSeIPipeline:
+    """
+    Pipeline for SenSeI (Sensitive Set Invariance) model.
+    
+    SenSeI is an in-training individual fairness algorithm that learns
+    to be invariant to changes in sensitive attributes.
+    """
+    
+    def __init__(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        X_protected: np.ndarray,
+        proxy_col_idx: int,
+        n_cv_splits: int = 5,
+    ):
+        """
+        Parameters
+        ----------
+        X : np.ndarray
+            Feature matrix (WITHOUT sensitive features)
+        y : np.ndarray
+            Target labels
+        X_protected : np.ndarray
+            Sensitive features for learning fair distance metric
+        proxy_col_idx : int
+            Index of proxy column for counterfactual evaluation
+        n_cv_splits : int
+            Number of CV splits
+        """
+        if not SENSEI_AVAILABLE:
+            raise ImportError(
+                "inFairness not installed. Install with: pip install inFairness"
+            )
+        
+        self.X = X
+        self.y = y
+        self.X_protected = X_protected
+        self.proxy_col_idx = proxy_col_idx
+        self.n_cv_splits = n_cv_splits
+        
+        cv = StratifiedKFold(n_splits=n_cv_splits, shuffle=True, random_state=42)
+        self.cv_splits = list(cv.split(X, y))
+        
+        # Device selection: CUDA (NVIDIA) > MPS (Mac) > CPU
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+            print("Using MPS (Mac GPU) acceleration")
+        else:
+            self.device = torch.device("cpu")
+            print("Warning: No GPU available, using CPU (will be slow)")
+
+    @property
+    def configspace(self) -> ConfigurationSpace:
+        return get_sensei_configspace()
+    
+    def train(self, config: Configuration, seed: int = 0) -> Dict[str, float]:
+        """Train SenSeI model with cross-validation.
+        
+        Implementation follows IBM's inFairness example:
+        https://github.com/IBM/inFairness/blob/main/examples/adult-income-prediction/
+        """
+        accuracy_scores = []
+        consistency_scores = []
+        
+        for train_idx, test_idx in self.cv_splits:
+            X_train = self.X[train_idx]
+            X_test = self.X[test_idx]
+            y_train = self.y[train_idx]
+            y_test = self.y[test_idx]
+            X_prot_train = self.X_protected[train_idx]
+            
+            # Convert to torch tensors
+            X_train_t = torch.FloatTensor(X_train).to(self.device)
+            y_train_t = torch.LongTensor(y_train).to(self.device)
+            X_test_t = torch.FloatTensor(X_test).to(self.device)
+            X_prot_train_t = torch.FloatTensor(X_prot_train).to(self.device)
+            
+            # Build network architecture (same as IBM: FC layers with ReLU)
+            n_features = X_train.shape[1]
+            hidden_sizes = [config["n_neurons"]] * config["n_hidden_layers"]
+            output_size = 2  # Binary classification
+            
+            layers = []
+            prev_size = n_features
+            for h_size in hidden_sizes:
+                layers.extend([
+                    torch.nn.Linear(prev_size, h_size),
+                    torch.nn.ReLU(),
+                ])
+                prev_size = h_size
+            layers.append(torch.nn.Linear(prev_size, output_size))
+            
+            network = torch.nn.Sequential(*layers).to(self.device)
+            
+            # ============================================================
+            # Distance metrics (following IBM's approach)
+            # ============================================================
+            
+            # Input space distance: LogisticRegSensitiveSubspace
+            # This learns to ignore variations in sensitive attributes
+            distance_x = LogisticRegSensitiveSubspace()
+            distance_x.fit(X_train_t, data_SensitiveAttrs=X_prot_train_t)
+            distance_x.to(self.device)
+            
+            # Output space distance: SquaredEuclideanDistance
+            distance_y = SquaredEuclideanDistance()
+            distance_y.fit(num_dims=output_size)
+            distance_y.to(self.device)
+            
+            # ============================================================
+            # Create SenSeI model (with all required parameters)
+            # ============================================================
+            sensei = SenSeI(
+                network=network,
+                distance_x=distance_x,
+                distance_y=distance_y,
+                loss_fn=F.cross_entropy,
+                rho=config["rho"],
+                eps=config["eps"],
+                auditor_nsteps=config["auditor_nsteps"],
+                auditor_lr=config["auditor_lr"],
+            )
+            
+            # ============================================================
+            # Training loop (following IBM's approach)
+            # ============================================================
+            optimizer = torch.optim.Adam(network.parameters(), lr=config["learning_rate"])
+            batch_size = config["batch_size"]
+            n_epochs = config["epochs"]
+            
+            sensei.train()  # Set to training mode
+            
+            for epoch in range(n_epochs):
+                # Shuffle training data
+                perm = torch.randperm(len(X_train_t))
+                
+                for i in range(0, len(X_train_t), batch_size):
+                    idx = perm[i:i+batch_size]
+                    X_batch = X_train_t[idx]
+                    y_batch = y_train_t[idx]
+                    
+                    optimizer.zero_grad()
+                    # IBM's approach: result = fairalgo(x, y), result.loss.backward()
+                    result = sensei(X_batch, y_batch)
+                    result.loss.backward()
+                    optimizer.step()
+            
+            # ============================================================
+            # Evaluation
+            # ============================================================
+            network.eval()
+            with torch.no_grad():
+                logits = network(X_test_t)
+                y_pred = logits.argmax(dim=1).cpu().numpy()
+                
+                # Counterfactual on proxy (following IBM's spouse_consistency)
+                X_test_flipped = create_flipped_data(X_test, self.proxy_col_idx)
+                X_test_flipped_t = torch.FloatTensor(X_test_flipped).to(self.device)
+                logits_flipped = network(X_test_flipped_t)
+                y_pred_flipped = logits_flipped.argmax(dim=1).cpu().numpy()
+            
+            acc = balanced_accuracy_score(y_test, y_pred)
+            consistency = counterfactual_consistency(y_pred, y_pred_flipped)
+            
+            accuracy_scores.append(acc)
+            consistency_scores.append(consistency)
+        
+        return {
+            "error": 1.0 - np.mean(accuracy_scores),
+            "inconsistency": 1.0 - np.mean(consistency_scores),
+        }
+
+
+# =============================================================================
 # SMAC Optimization
 # =============================================================================
 
@@ -227,6 +550,7 @@ def run_optimization(
     walltime_limit: int = 300,
     n_trials: int = 100,
     output_dir: str = "smac_output",
+    approach: int = 1,
 ) -> AbstractFacade:
     """
     Run SMAC multi-objective optimization for a model.
@@ -234,15 +558,17 @@ def run_optimization(
     Parameters
     ----------
     model_type : str
-        "rf" or "mlp"
+        "rf", "mlp", or "sensei"
     data : dict
-        Data dictionary from load_adult_dataset()
+        Data dictionary from load_dataset() or load_dataset_approach2()
     walltime_limit : int
         Time limit in seconds
     n_trials : int
         Maximum number of configurations to try
     output_dir : str
         Directory to save SMAC output
+    approach : int
+        1 = with sensitive features, 2 = without sensitive features
 
     Returns
     -------
@@ -250,16 +576,36 @@ def run_optimization(
         SMAC optimizer with results
     """
     print(f"\n{'='*60}")
-    print(f"Running SMAC optimization for {model_type.upper()}")
+    print(f"Running SMAC optimization for {model_type.upper()} (Approach {approach})")
     print(f"{'='*60}")
     
-    # Create pipeline
-    pipeline = FairnessPipeline(
-        model_type=model_type,
-        X=data['X_train'],
-        y=data['y_train'],
-        sensitive_col_idx=data['sensitive_col_idx'],
-    )
+    # Create appropriate pipeline based on approach
+    if approach == 1:
+        # Approach 1: With sensitive features
+        pipeline = FairnessPipeline(
+            model_type=model_type,
+            X=data['X_train'],
+            y=data['y_train'],
+            sensitive_col_idx=data['sensitive_col_idx'],
+        )
+    else:
+        # Approach 2: Without sensitive features
+        if model_type == "sensei":
+            if not SENSEI_AVAILABLE:
+                raise ImportError("SenSeI requires inFairness. Install with: pip install inFairness")
+            pipeline = SenSeIPipeline(
+                X=data['X_train'],
+                y=data['y_train'],
+                X_protected=data['X_protected'],
+                proxy_col_idx=data['proxy_col_idx'],
+            )
+        else:
+            pipeline = FairnessPipelineApproach2(
+                model_type=model_type,
+                X=data['X_train'],
+                y=data['y_train'],
+                proxy_col_idx=data['proxy_col_idx'],
+            )
     
     # Define scenario
     objectives = ["error", "inconsistency"]
@@ -270,7 +616,7 @@ def run_optimization(
         walltime_limit=walltime_limit,
         n_trials=n_trials,
         n_workers=1,
-        output_directory=os.path.join(output_dir, model_type),
+        output_directory=os.path.join(output_dir, f"{model_type}_approach{approach}"),
     )
 
     # Create SMAC
@@ -840,7 +1186,7 @@ def generate_all_visualizations(
 
 
 # =============================================================================
-# Main Entry Point
+# Main Entry Points
 # =============================================================================
 
 def main(
@@ -850,7 +1196,7 @@ def main(
     n_trials: int = 100,
 ):
     """
-    Run the full experiment.
+    Run Approach 1: Standard models WITH sensitive features.
     
     Parameters
     ----------
@@ -887,11 +1233,101 @@ def main(
             data=data,
             walltime_limit=walltime_limit,
             n_trials=n_trials,
+            approach=1,
         )
         results[model_type] = smac
     
     # Plot and summarize results
     generate_all_visualizations(results, dataset_name, sensitive_feature)
+    print_pareto_summary(results)
+    
+    return results, data
+
+
+def main_approach2(
+    dataset_name: str = "adult",
+    sensitive_features_to_remove: List[str] = None,
+    proxy_feature: str = "relationship",
+    walltime_limit: int = 300,
+    n_trials: int = 100,
+    include_sensei: bool = True,
+):
+    """
+    Run Approach 2: Models WITHOUT sensitive features + SenSeI comparison.
+    
+    Parameters
+    ----------
+    dataset_name : str
+        Name of dataset to use
+    sensitive_features_to_remove : list
+        Sensitive features to remove from training (default: ["sex", "race"])
+    proxy_feature : str
+        Proxy feature to use for counterfactual evaluation (default: "relationship")
+    walltime_limit : int
+        Time limit per model in seconds
+    n_trials : int
+        Max configurations per model
+    include_sensei : bool
+        Whether to include SenSeI model (requires inFairness)
+    """
+    if sensitive_features_to_remove is None:
+        sensitive_features_to_remove = ["sex", "race"]
+    
+    config = get_dataset_config(dataset_name)
+    
+    print("="*60)
+    print("APPROACH 2: Models WITHOUT Sensitive Features")
+    print("="*60)
+    print(f"Dataset: {config.name} (OpenML ID: {config.openml_id})")
+    print(f"Sensitive features REMOVED: {sensitive_features_to_remove}")
+    print(f"Proxy feature for counterfactual: {proxy_feature}")
+    print(f"Time limit per model: {walltime_limit}s")
+    print(f"Max trials per model: {n_trials}")
+    
+    if include_sensei and not SENSEI_AVAILABLE:
+        print("\nWarning: SenSeI not available (inFairness not installed)")
+        include_sensei = False
+    
+    # Load data for Approach 2 (using unified load_dataset with approach=2)
+    print(f"\nLoading {config.name} dataset (Approach 2)...")
+    data = load_dataset(
+        dataset_name,
+        approach=2,
+        sensitive_features_to_remove=sensitive_features_to_remove,
+        proxy_feature=proxy_feature,
+    )
+    
+    # Run optimization for each model
+    results = {}
+    
+    # Standard models without sensitive features
+    for model_type in ["rf", "mlp"]:
+        smac = run_optimization(
+            model_type=model_type,
+            data=data,
+            walltime_limit=walltime_limit,
+            n_trials=n_trials,
+            approach=2,
+        )
+        results[model_type] = smac
+    
+    # SenSeI (if available)
+    if include_sensei:
+        smac = run_optimization(
+            model_type="sensei",
+            data=data,
+            walltime_limit=walltime_limit,
+            n_trials=n_trials,
+            approach=2,
+        )
+        results["sensei"] = smac
+    
+    # Plot and summarize results
+    generate_all_visualizations(
+        results, 
+        dataset_name, 
+        f"proxy_{proxy_feature}_approach2"
+    )
     print_pareto_summary(results)
     
     return results, data
