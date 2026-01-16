@@ -21,9 +21,7 @@ from __future__ import annotations
 import os
 import warnings
 from typing import Optional, Dict, List
-from copy import deepcopy
 
-import matplotlib.pyplot as plt
 import numpy as np
 from ConfigSpace import (
     Categorical,
@@ -36,12 +34,6 @@ from ConfigSpace import (
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import balanced_accuracy_score
-from sklearn.model_selection import StratifiedKFold
-from sklearn.base import clone
-from sklearn.manifold import MDS
-from sklearn.preprocessing import MinMaxScaler
-import matplotlib.cm as cm
-from matplotlib.colors import Normalize
 
 from smac import HyperparameterOptimizationFacade as HPOFacade
 from smac import Scenario
@@ -180,54 +172,58 @@ def create_mlp_model(config: Configuration) -> MLPClassifier:
 
 
 # =============================================================================
-# Training and Evaluation Pipeline
+# Training and Evaluation Pipeline (Train/Validation Split)
 # =============================================================================
 
 class FairnessPipeline:
     """
     Pipeline for multi-objective optimization with fairness.
     
-    Trains models using cross-validation and evaluates both
-    accuracy and counterfactual consistency.
+    Trains models on training set and evaluates on validation set.
+    This ensures case studies can use the same validation data that SMAC optimized for.
     
     Supports both binary and multiclass sensitive features:
     - Binary: flip single column (0 <-> 1)
-    - Multiclass: exhaustive flip to all other categories, average consistency
+    - Multiclass: exhaustive flip to all other categories
     """
     
     def __init__(
         self,
         model_type: str,
-        X: np.ndarray,
-        y: np.ndarray,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
         sensitive_col_idx: Optional[int] = None,
         sensitive_col_indices: Optional[List[int]] = None,
         is_multiclass: bool = False,
-        n_cv_splits: int = 5,
     ):
         """
         Parameters
         ----------
         model_type : str
             "rf" for Random Forest, "mlp" for MLP
-        X : np.ndarray
-            Feature matrix
-        y : np.ndarray
-            Target labels
+        X_train : np.ndarray
+            Training feature matrix
+        y_train : np.ndarray
+            Training target labels
+        X_val : np.ndarray
+            Validation feature matrix
+        y_val : np.ndarray
+            Validation target labels
         sensitive_col_idx : int, optional
             Index of sensitive column for binary counterfactual
         sensitive_col_indices : list of int, optional
             Indices of sensitive columns for multiclass counterfactual
         is_multiclass : bool
             If True, use exhaustive multiclass counterfactual
-        n_cv_splits : int
-            Number of cross-validation splits
         """
         self.model_type = model_type
-        self.X = X
-        self.y = y
+        self.X_train = X_train
+        self.y_train = y_train
+        self.X_val = X_val
+        self.y_val = y_val
         self.is_multiclass = is_multiclass
-        self.n_cv_splits = n_cv_splits
         
         if is_multiclass:
             if sensitive_col_indices is None:
@@ -237,10 +233,6 @@ class FairnessPipeline:
             if sensitive_col_idx is None:
                 raise ValueError("sensitive_col_idx required for binary")
             self.sensitive_col_idx = sensitive_col_idx
-        
-        # Pre-compute CV splits for consistency
-        cv = StratifiedKFold(n_splits=n_cv_splits, shuffle=True, random_state=42)
-        self.cv_splits = list(cv.split(X, y))
 
     @property
     def configspace(self) -> ConfigurationSpace:
@@ -259,7 +251,7 @@ class FairnessPipeline:
     
     def train(self, config: Configuration, seed: int = 0) -> Dict[str, float]:
         """
-        Train and evaluate a configuration using cross-validation.
+        Train on training set and evaluate on validation set.
         
         Returns
         -------
@@ -267,95 +259,84 @@ class FairnessPipeline:
             - error: 1 - balanced_accuracy (lower = better)
             - inconsistency: 1 - counterfactual_consistency (lower = better)
         """
-        accuracy_scores = []
-        consistency_scores = []
-
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore")
-
-            for train_idx, test_idx in self.cv_splits:
-                # Split data
-                X_train, X_test = self.X[train_idx], self.X[test_idx]
-                y_train, y_test = self.y[train_idx], self.y[test_idx]
-                
-                # Create and train model
-                model = self._create_model(config)
-                model.fit(X_train, y_train)
-                
-                # Evaluate accuracy
-                y_pred = model.predict(X_test)
-                acc = balanced_accuracy_score(y_test, y_pred)
-                accuracy_scores.append(acc)
-                
-                # Evaluate counterfactual consistency
-                if self.is_multiclass:
-                    # Multiclass: exhaustive flip to all categories
-                    flipped_versions, orig_cats = create_flipped_data_multiclass_exhaustive(
-                        X_test, self.sensitive_col_indices
-                    )
-                    # Get predictions for each flipped version
-                    y_preds_flipped = [model.predict(X_flip) for X_flip in flipped_versions]
-                    consistency = counterfactual_consistency_multiclass_exhaustive(
-                        y_pred, y_preds_flipped, orig_cats
-                    )
-                else:
-                    # Binary: simple flip
-                    X_test_flipped = create_flipped_data(X_test, self.sensitive_col_idx)
-                    y_pred_flipped = model.predict(X_test_flipped)
-                    consistency = counterfactual_consistency(y_pred, y_pred_flipped)
-                
-                consistency_scores.append(consistency)
+            
+            # Create and train model on training set
+            model = self._create_model(config)
+            model.fit(self.X_train, self.y_train)
+            
+            # Evaluate accuracy on validation set
+            y_pred = model.predict(self.X_val)
+            accuracy = balanced_accuracy_score(self.y_val, y_pred)
+            
+            # Evaluate counterfactual consistency on validation set
+            if self.is_multiclass:
+                # Multiclass: exhaustive flip to all categories
+                flipped_versions, orig_cats = create_flipped_data_multiclass_exhaustive(
+                    self.X_val, self.sensitive_col_indices
+                )
+                # Get predictions for each flipped version
+                y_preds_flipped = [model.predict(X_flip) for X_flip in flipped_versions]
+                consistency = counterfactual_consistency_multiclass_exhaustive(
+                    y_pred, y_preds_flipped, orig_cats
+                )
+            else:
+                # Binary: simple flip
+                X_val_flipped = create_flipped_data(self.X_val, self.sensitive_col_idx)
+                y_pred_flipped = model.predict(X_val_flipped)
+                consistency = counterfactual_consistency(y_pred, y_pred_flipped)
         
         # Return objectives (SMAC minimizes, so return 1 - score)
         return {
-            "error": 1.0 - np.mean(accuracy_scores),
-            "inconsistency": 1.0 - np.mean(consistency_scores),
+            "error": 1.0 - accuracy,
+            "inconsistency": 1.0 - consistency,
         }
 
 
 # =============================================================================
-# Approach 2: Pipeline WITHOUT Sensitive Features
+# Approach 2: Pipeline WITHOUT Sensitive Features (Train/Validation Split)
 # =============================================================================
 
 class FairnessPipelineApproach2:
     """
     Pipeline for Approach 2: Models trained WITHOUT sensitive features.
     
-    Counterfactual consistency is evaluated on a proxy feature instead
-    of the sensitive feature directly.
+    Trains on training set and evaluates on validation set.
+    Counterfactual consistency is evaluated on a proxy feature.
     """
     
     def __init__(
         self,
         model_type: str,
-        X: np.ndarray,
-        y: np.ndarray,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
         proxy_col_idx: int,  # Proxy column for counterfactual
-        n_cv_splits: int = 5,
     ):
         """
         Parameters
         ----------
         model_type : str
             "rf" for Random Forest, "mlp" for MLP
-        X : np.ndarray
-            Feature matrix (WITHOUT sensitive features)
-        y : np.ndarray
-            Target labels
+        X_train : np.ndarray
+            Training feature matrix (WITHOUT sensitive features)
+        y_train : np.ndarray
+            Training target labels
+        X_val : np.ndarray
+            Validation feature matrix
+        y_val : np.ndarray
+            Validation target labels
         proxy_col_idx : int
             Index of proxy column for counterfactual (e.g., relationship_Wife)
-        n_cv_splits : int
-            Number of cross-validation splits
         """
         self.model_type = model_type
-        self.X = X
-        self.y = y
+        self.X_train = X_train
+        self.y_train = y_train
+        self.X_val = X_val
+        self.y_val = y_val
         self.proxy_col_idx = proxy_col_idx
-        self.n_cv_splits = n_cv_splits
-        
-        # Pre-compute CV splits
-        cv = StratifiedKFold(n_splits=n_cv_splits, shuffle=True, random_state=42)
-        self.cv_splits = list(cv.split(X, y))
 
     @property
     def configspace(self) -> ConfigurationSpace:
@@ -374,35 +355,27 @@ class FairnessPipelineApproach2:
     
     def train(self, config: Configuration, seed: int = 0) -> Dict[str, float]:
         """
-        Train and evaluate using proxy-based counterfactual consistency.
+        Train on training set and evaluate on validation set using proxy-based consistency.
         """
-        accuracy_scores = []
-        consistency_scores = []
-
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore")
-
-            for train_idx, test_idx in self.cv_splits:
-                X_train, X_test = self.X[train_idx], self.X[test_idx]
-                y_train, y_test = self.y[train_idx], self.y[test_idx]
-                
-                model = self._create_model(config)
-                model.fit(X_train, y_train)
-                
-                # Evaluate accuracy
-                y_pred = model.predict(X_test)
-                acc = balanced_accuracy_score(y_test, y_pred)
-                accuracy_scores.append(acc)
-                
-                # Evaluate counterfactual consistency on PROXY column
-                X_test_flipped = create_flipped_data(X_test, self.proxy_col_idx)
-                y_pred_flipped = model.predict(X_test_flipped)
-                consistency = counterfactual_consistency(y_pred, y_pred_flipped)
-                consistency_scores.append(consistency)
+            
+            # Create and train model on training set
+            model = self._create_model(config)
+            model.fit(self.X_train, self.y_train)
+            
+            # Evaluate accuracy on validation set
+            y_pred = model.predict(self.X_val)
+            accuracy = balanced_accuracy_score(self.y_val, y_pred)
+            
+            # Evaluate counterfactual consistency on PROXY column
+            X_val_flipped = create_flipped_data(self.X_val, self.proxy_col_idx)
+            y_pred_flipped = model.predict(X_val_flipped)
+            consistency = counterfactual_consistency(y_pred, y_pred_flipped)
         
         return {
-            "error": 1.0 - np.mean(accuracy_scores),
-            "inconsistency": 1.0 - np.mean(consistency_scores),
+            "error": 1.0 - accuracy,
+            "inconsistency": 1.0 - consistency,
         }
 
 
@@ -439,45 +412,47 @@ class SenSeIPipeline:
     """
     Pipeline for SenSeI (Sensitive Set Invariance) model.
     
+    Trains on training set and evaluates on validation set.
     SenSeI is an in-training individual fairness algorithm that learns
     to be invariant to changes in sensitive attributes.
     """
     
     def __init__(
         self,
-        X: np.ndarray,
-        y: np.ndarray,
-        X_protected: np.ndarray,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
+        X_protected_train: np.ndarray,
         proxy_col_idx: int,
-        n_cv_splits: int = 5,
     ):
         """
         Parameters
         ----------
-        X : np.ndarray
-            Feature matrix (WITHOUT sensitive features)
-        y : np.ndarray
-            Target labels
-        X_protected : np.ndarray
-            Sensitive features for learning fair distance metric
+        X_train : np.ndarray
+            Training feature matrix (WITHOUT sensitive features)
+        y_train : np.ndarray
+            Training target labels
+        X_val : np.ndarray
+            Validation feature matrix
+        y_val : np.ndarray
+            Validation target labels
+        X_protected_train : np.ndarray
+            Sensitive features for learning fair distance metric (training only)
         proxy_col_idx : int
             Index of proxy column for counterfactual evaluation
-        n_cv_splits : int
-            Number of CV splits
         """
         if not SENSEI_AVAILABLE:
             raise ImportError(
                 "inFairness not installed. Install with: pip install inFairness"
             )
         
-        self.X = X
-        self.y = y
-        self.X_protected = X_protected
+        self.X_train = X_train
+        self.y_train = y_train
+        self.X_val = X_val
+        self.y_val = y_val
+        self.X_protected_train = X_protected_train
         self.proxy_col_idx = proxy_col_idx
-        self.n_cv_splits = n_cv_splits
-        
-        cv = StratifiedKFold(n_splits=n_cv_splits, shuffle=True, random_state=42)
-        self.cv_splits = list(cv.split(X, y))
         
         # Device selection: CUDA (NVIDIA) > MPS (Mac) > CPU
         if torch.cuda.is_available():
@@ -494,120 +469,107 @@ class SenSeIPipeline:
         return get_sensei_configspace()
     
     def train(self, config: Configuration, seed: int = 0) -> Dict[str, float]:
-        """Train SenSeI model with cross-validation.
+        """Train SenSeI model on training set and evaluate on validation set.
         
         Implementation follows IBM's inFairness example:
         https://github.com/IBM/inFairness/blob/main/examples/adult-income-prediction/
         """
-        accuracy_scores = []
-        consistency_scores = []
+        # Convert to torch tensors
+        X_train_t = torch.FloatTensor(self.X_train).to(self.device)
+        y_train_t = torch.LongTensor(self.y_train).to(self.device)
+        X_val_t = torch.FloatTensor(self.X_val).to(self.device)
+        X_prot_train_t = torch.FloatTensor(self.X_protected_train).to(self.device)
         
-        for train_idx, test_idx in self.cv_splits:
-            X_train = self.X[train_idx]
-            X_test = self.X[test_idx]
-            y_train = self.y[train_idx]
-            y_test = self.y[test_idx]
-            X_prot_train = self.X_protected[train_idx]
+        # Build network architecture (same as IBM: FC layers with ReLU)
+        n_features = self.X_train.shape[1]
+        hidden_sizes = [config["n_neurons"]] * config["n_hidden_layers"]
+        output_size = 2  # Binary classification
+        
+        layers = []
+        prev_size = n_features
+        for h_size in hidden_sizes:
+            layers.extend([
+                torch.nn.Linear(prev_size, h_size),
+                torch.nn.ReLU(),
+            ])
+            prev_size = h_size
+        layers.append(torch.nn.Linear(prev_size, output_size))
+        
+        network = torch.nn.Sequential(*layers).to(self.device)
+        
+        # ============================================================
+        # Distance metrics (following IBM's approach)
+        # ============================================================
+        
+        # Input space distance: LogisticRegSensitiveSubspace
+        # This learns to ignore variations in sensitive attributes
+        distance_x = LogisticRegSensitiveSubspace()
+        distance_x.fit(X_train_t, data_SensitiveAttrs=X_prot_train_t)
+        distance_x.to(self.device)
+        
+        # Output space distance: SquaredEuclideanDistance
+        distance_y = SquaredEuclideanDistance()
+        distance_y.fit(num_dims=output_size)
+        distance_y.to(self.device)
+        
+        # ============================================================
+        # Create SenSeI model (with all required parameters)
+        # ============================================================
+        sensei = SenSeI(
+            network=network,
+            distance_x=distance_x,
+            distance_y=distance_y,
+            loss_fn=F.cross_entropy,
+            rho=config["rho"],
+            eps=config["eps"],
+            auditor_nsteps=config["auditor_nsteps"],
+            auditor_lr=config["auditor_lr"],
+        )
+        
+        # ============================================================
+        # Training loop (following IBM's approach)
+        # ============================================================
+        optimizer = torch.optim.Adam(network.parameters(), lr=config["learning_rate"])
+        batch_size = config["batch_size"]
+        n_epochs = config["epochs"]
+        
+        sensei.train()  # Set to training mode
+        
+        for epoch in range(n_epochs):
+            # Shuffle training data
+            perm = torch.randperm(len(X_train_t))
             
-            # Convert to torch tensors
-            X_train_t = torch.FloatTensor(X_train).to(self.device)
-            y_train_t = torch.LongTensor(y_train).to(self.device)
-            X_test_t = torch.FloatTensor(X_test).to(self.device)
-            X_prot_train_t = torch.FloatTensor(X_prot_train).to(self.device)
-            
-            # Build network architecture (same as IBM: FC layers with ReLU)
-            n_features = X_train.shape[1]
-            hidden_sizes = [config["n_neurons"]] * config["n_hidden_layers"]
-            output_size = 2  # Binary classification
-            
-            layers = []
-            prev_size = n_features
-            for h_size in hidden_sizes:
-                layers.extend([
-                    torch.nn.Linear(prev_size, h_size),
-                    torch.nn.ReLU(),
-                ])
-                prev_size = h_size
-            layers.append(torch.nn.Linear(prev_size, output_size))
-            
-            network = torch.nn.Sequential(*layers).to(self.device)
-            
-            # ============================================================
-            # Distance metrics (following IBM's approach)
-            # ============================================================
-            
-            # Input space distance: LogisticRegSensitiveSubspace
-            # This learns to ignore variations in sensitive attributes
-            distance_x = LogisticRegSensitiveSubspace()
-            distance_x.fit(X_train_t, data_SensitiveAttrs=X_prot_train_t)
-            distance_x.to(self.device)
-            
-            # Output space distance: SquaredEuclideanDistance
-            distance_y = SquaredEuclideanDistance()
-            distance_y.fit(num_dims=output_size)
-            distance_y.to(self.device)
-            
-            # ============================================================
-            # Create SenSeI model (with all required parameters)
-            # ============================================================
-            sensei = SenSeI(
-                network=network,
-                distance_x=distance_x,
-                distance_y=distance_y,
-                loss_fn=F.cross_entropy,
-                rho=config["rho"],
-                eps=config["eps"],
-                auditor_nsteps=config["auditor_nsteps"],
-                auditor_lr=config["auditor_lr"],
-            )
-            
-            # ============================================================
-            # Training loop (following IBM's approach)
-            # ============================================================
-            optimizer = torch.optim.Adam(network.parameters(), lr=config["learning_rate"])
-            batch_size = config["batch_size"]
-            n_epochs = config["epochs"]
-            
-            sensei.train()  # Set to training mode
-            
-            for epoch in range(n_epochs):
-                # Shuffle training data
-                perm = torch.randperm(len(X_train_t))
+            for i in range(0, len(X_train_t), batch_size):
+                idx = perm[i:i+batch_size]
+                X_batch = X_train_t[idx]
+                y_batch = y_train_t[idx]
                 
-                for i in range(0, len(X_train_t), batch_size):
-                    idx = perm[i:i+batch_size]
-                    X_batch = X_train_t[idx]
-                    y_batch = y_train_t[idx]
-                    
-                    optimizer.zero_grad()
-                    # IBM's approach: result = fairalgo(x, y), result.loss.backward()
-                    result = sensei(X_batch, y_batch)
-                    result.loss.backward()
-                    optimizer.step()
+                optimizer.zero_grad()
+                # IBM's approach: result = fairalgo(x, y), result.loss.backward()
+                result = sensei(X_batch, y_batch)
+                result.loss.backward()
+                optimizer.step()
+        
+        # ============================================================
+        # Evaluation on validation set
+        # ============================================================
+        network.eval()
+        with torch.no_grad():
+            logits = network(X_val_t)
+            y_pred = logits.argmax(dim=1).cpu().numpy()
             
-            # ============================================================
-            # Evaluation
-            # ============================================================
-            network.eval()
-            with torch.no_grad():
-                logits = network(X_test_t)
-                y_pred = logits.argmax(dim=1).cpu().numpy()
-                
-                # Counterfactual on proxy (following IBM's spouse_consistency)
-                X_test_flipped = create_flipped_data(X_test, self.proxy_col_idx)
-                X_test_flipped_t = torch.FloatTensor(X_test_flipped).to(self.device)
-                logits_flipped = network(X_test_flipped_t)
-                y_pred_flipped = logits_flipped.argmax(dim=1).cpu().numpy()
-            
-            acc = balanced_accuracy_score(y_test, y_pred)
-            consistency = counterfactual_consistency(y_pred, y_pred_flipped)
-            
-            accuracy_scores.append(acc)
-            consistency_scores.append(consistency)
+            # Counterfactual on proxy (following IBM's spouse_consistency)
+            X_val_flipped = create_flipped_data(self.X_val, self.proxy_col_idx)
+            X_val_flipped_t = torch.FloatTensor(X_val_flipped).to(self.device)
+            logits_flipped = network(X_val_flipped_t)
+            y_pred_flipped = logits_flipped.argmax(dim=1).cpu().numpy()
+        
+        accuracy = balanced_accuracy_score(self.y_val, y_pred)
+        consistency = counterfactual_consistency(y_pred, y_pred_flipped)
         
         return {
-            "error": 1.0 - np.mean(accuracy_scores),
-            "inconsistency": 1.0 - np.mean(consistency_scores),
+            "error": 1.0 - accuracy,
+            "inconsistency": 1.0 - consistency,
         }
 
 
@@ -631,7 +593,11 @@ def run_optimization(
     model_type : str
         "rf", "mlp", or "sensei"
     data : dict
-        Data dictionary from load_dataset() or load_dataset_approach2()
+        Data dictionary from load_dataset() containing:
+        - X_train, y_train: Training data
+        - X_val, y_val: Validation data (for SMAC evaluation)
+        - X_test, y_test: Test data (held out for final evaluation)
+        - sensitive_col_idx or sensitive_col_indices: Sensitive feature info
     walltime_limit : int
         Time limit in seconds
     n_trials : int
@@ -650,6 +616,16 @@ def run_optimization(
     print(f"Running SMAC optimization for {model_type.upper()} (Approach {approach})")
     print(f"{'='*60}")
     
+    # Validate that validation data exists
+    if 'X_val' not in data or 'y_val' not in data:
+        raise ValueError(
+            "data dict must contain 'X_val' and 'y_val'. "
+            "Use train_test_split before calling run_optimization."
+        )
+    
+    print(f"Training samples: {len(data['X_train']):,}")
+    print(f"Validation samples: {len(data['X_val']):,}")
+    
     # Create appropriate pipeline based on approach
     if approach == 1:
         # Approach 1: With sensitive features (binary or multiclass)
@@ -659,8 +635,10 @@ def run_optimization(
             print(f"Using MULTICLASS counterfactual (exhaustive, {len(data['sensitive_col_indices'])} categories)")
             pipeline = FairnessPipeline(
                 model_type=model_type,
-                X=data['X_train'],
-                y=data['y_train'],
+                X_train=data['X_train'],
+                y_train=data['y_train'],
+                X_val=data['X_val'],
+                y_val=data['y_val'],
                 sensitive_col_indices=data['sensitive_col_indices'],
                 is_multiclass=True,
             )
@@ -668,8 +646,10 @@ def run_optimization(
             print(f"Using BINARY counterfactual (single column flip)")
             pipeline = FairnessPipeline(
                 model_type=model_type,
-                X=data['X_train'],
-                y=data['y_train'],
+                X_train=data['X_train'],
+                y_train=data['y_train'],
+                X_val=data['X_val'],
+                y_val=data['y_val'],
                 sensitive_col_idx=data['sensitive_col_idx'],
                 is_multiclass=False,
             )
@@ -679,16 +659,20 @@ def run_optimization(
             if not SENSEI_AVAILABLE:
                 raise ImportError("SenSeI requires inFairness. Install with: pip install inFairness")
             pipeline = SenSeIPipeline(
-                X=data['X_train'],
-                y=data['y_train'],
-                X_protected=data['X_protected'],
+                X_train=data['X_train'],
+                y_train=data['y_train'],
+                X_val=data['X_val'],
+                y_val=data['y_val'],
+                X_protected_train=data['X_protected_train'],
                 proxy_col_idx=data['proxy_col_idx'],
             )
         else:
             pipeline = FairnessPipelineApproach2(
                 model_type=model_type,
-                X=data['X_train'],
-                y=data['y_train'],
+                X_train=data['X_train'],
+                y_train=data['y_train'],
+                X_val=data['X_val'],
+                y_val=data['y_val'],
                 proxy_col_idx=data['proxy_col_idx'],
             )
     
