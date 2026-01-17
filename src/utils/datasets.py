@@ -372,14 +372,26 @@ def load_dataset(
         X_encoded = X_encoded.drop(columns=cols_to_remove, errors='ignore')
         feature_names_final = list(X_encoded.columns)
         
-        # Find proxy column index
+        # Find proxy column index (legacy - single column)
         proxy_col_name = config.proxy_features[proxy_feature]
         if proxy_col_name not in feature_names_final:
             raise ValueError(f"Proxy column '{proxy_col_name}' not found.")
         proxy_col_idx = feature_names_final.index(proxy_col_name)
         
+        # Find relationship columns for improved sex proxy flip
+        # These are needed for the sex_proxy flip function
+        relationship_cols = {}
+        for rel_col in ['relationship_Husband', 'relationship_Wife', 'relationship_Unmarried']:
+            if rel_col in feature_names_final:
+                relationship_cols[rel_col] = feature_names_final.index(rel_col)
+            else:
+                relationship_cols[rel_col] = None
+        
         print(f"\nProtected features (for SenSeI): {protected_feature_names}")
         print(f"Proxy column for counterfactual: {proxy_col_name} (index {proxy_col_idx})")
+        print(f"Relationship columns for sex proxy flip:")
+        for col_name, col_idx in relationship_cols.items():
+            print(f"  {col_name}: index {col_idx}")
     
     # Convert to numpy
     X = X_encoded.values.astype(np.float32)
@@ -424,6 +436,10 @@ def load_dataset(
             'protected_feature_names': protected_feature_names,
             'proxy_col_idx': proxy_col_idx,
             'proxy_col_name': proxy_col_name,
+            # Relationship columns for improved sex proxy flip
+            'husband_col_idx': relationship_cols.get('relationship_Husband'),
+            'wife_col_idx': relationship_cols.get('relationship_Wife'),
+            'unmarried_col_idx': relationship_cols.get('relationship_Unmarried'),
         })
     
     return result
@@ -479,6 +495,60 @@ def create_flipped_data(X: np.ndarray, sensitive_col_idx: int) -> np.ndarray:
     """
     X_flipped = X.copy()
     X_flipped[:, sensitive_col_idx] = 1 - X_flipped[:, sensitive_col_idx]
+    return X_flipped
+
+
+def create_flipped_data_sex_proxy(
+    X: np.ndarray, 
+    husband_idx: int,
+    wife_idx: int,
+    unmarried_idx: int
+) -> np.ndarray:
+    """
+    Create counterfactual data by flipping sex proxy (relationship columns).
+    
+    Implements a more semantically correct sex flip using relationship columns:
+    
+    Case 1: Husband=1 → Set Husband=0, Wife=1 (male→female)
+    Case 2: Husband=0 → Set Husband=1, and:
+            - If Wife=1: Set Wife=0 (female→male)
+            - If Unmarried=1: Set Unmarried=0 (unmarried→married male)
+    
+    Parameters
+    ----------
+    X : np.ndarray
+        Feature matrix
+    husband_idx : int
+        Index of relationship_Husband column
+    wife_idx : int
+        Index of relationship_Wife column  
+    unmarried_idx : int
+        Index of relationship_Unmarried column
+        
+    Returns
+    -------
+    X_flipped : np.ndarray
+        Feature matrix with sex proxy flipped
+    """
+    X_flipped = X.copy()
+    
+    # Case 1: Husband=1 → Wife (male to female)
+    is_husband = X[:, husband_idx] == 1
+    X_flipped[is_husband, husband_idx] = 0
+    X_flipped[is_husband, wife_idx] = 1
+    
+    # Case 2: Husband=0 → Husband=1
+    is_not_husband = X[:, husband_idx] == 0
+    X_flipped[is_not_husband, husband_idx] = 1
+    
+    # If was Wife, set Wife=0
+    was_wife = (X[:, wife_idx] == 1) & is_not_husband
+    X_flipped[was_wife, wife_idx] = 0
+    
+    # If was Unmarried, set Unmarried=0
+    was_unmarried = (X[:, unmarried_idx] == 1) & is_not_husband
+    X_flipped[was_unmarried, unmarried_idx] = 0
+    
     return X_flipped
 
 

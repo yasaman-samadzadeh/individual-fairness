@@ -3,6 +3,7 @@
 from utils.datasets import (
     load_dataset,
     create_flipped_data,
+    create_flipped_data_sex_proxy,
     list_available_datasets,
     get_dataset_config,
 )
@@ -24,6 +25,7 @@ __all__ = [
     # datasets
     "load_dataset",
     "create_flipped_data",
+    "create_flipped_data_sex_proxy",
     "list_available_datasets",
     "get_dataset_config",
     # individual_fairness

@@ -44,6 +44,7 @@ from utils.datasets import (
     load_dataset, 
     create_flipped_data,
     create_flipped_data_multiclass_exhaustive,
+    create_flipped_data_sex_proxy,
     counterfactual_consistency_multiclass_exhaustive,
     list_available_datasets, 
     get_dataset_config
@@ -313,7 +314,9 @@ class FairnessPipelineApproach2:
         y_train: np.ndarray,
         X_val: np.ndarray,
         y_val: np.ndarray,
-        proxy_col_idx: int,  # Proxy column for counterfactual
+        husband_col_idx: int,
+        wife_col_idx: int,
+        unmarried_col_idx: int,
     ):
         """
         Parameters
@@ -328,15 +331,21 @@ class FairnessPipelineApproach2:
             Validation feature matrix
         y_val : np.ndarray
             Validation target labels
-        proxy_col_idx : int
-            Index of proxy column for counterfactual (e.g., relationship_Wife)
+        husband_col_idx : int
+            Index of relationship_Husband column
+        wife_col_idx : int
+            Index of relationship_Wife column
+        unmarried_col_idx : int
+            Index of relationship_Unmarried column
         """
         self.model_type = model_type
         self.X_train = X_train
         self.y_train = y_train
         self.X_val = X_val
         self.y_val = y_val
-        self.proxy_col_idx = proxy_col_idx
+        self.husband_col_idx = husband_col_idx
+        self.wife_col_idx = wife_col_idx
+        self.unmarried_col_idx = unmarried_col_idx
 
     @property
     def configspace(self) -> ConfigurationSpace:
@@ -355,7 +364,11 @@ class FairnessPipelineApproach2:
     
     def train(self, config: Configuration, seed: int = 0) -> Dict[str, float]:
         """
-        Train on training set and evaluate on validation set using proxy-based consistency.
+        Train on training set and evaluate on validation set using sex proxy-based consistency.
+        
+        Uses improved sex proxy flip:
+        - Husband=1 → Wife=1 (male to female)
+        - Husband=0 → Husband=1, and if Wife=1 or Unmarried=1, set them to 0
         """
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore")
@@ -368,8 +381,13 @@ class FairnessPipelineApproach2:
             y_pred = model.predict(self.X_val)
             accuracy = balanced_accuracy_score(self.y_val, y_pred)
             
-            # Evaluate counterfactual consistency on PROXY column
-            X_val_flipped = create_flipped_data(self.X_val, self.proxy_col_idx)
+            # Evaluate counterfactual consistency using improved sex proxy flip
+            X_val_flipped = create_flipped_data_sex_proxy(
+                self.X_val, 
+                self.husband_col_idx,
+                self.wife_col_idx,
+                self.unmarried_col_idx
+            )
             y_pred_flipped = model.predict(X_val_flipped)
             consistency = counterfactual_consistency(y_pred, y_pred_flipped)
         
@@ -424,7 +442,9 @@ class SenSeIPipeline:
         X_val: np.ndarray,
         y_val: np.ndarray,
         X_protected_train: np.ndarray,
-        proxy_col_idx: int,
+        husband_col_idx: int,
+        wife_col_idx: int,
+        unmarried_col_idx: int,
     ):
         """
         Parameters
@@ -439,8 +459,12 @@ class SenSeIPipeline:
             Validation target labels
         X_protected_train : np.ndarray
             Sensitive features for learning fair distance metric (training only)
-        proxy_col_idx : int
-            Index of proxy column for counterfactual evaluation
+        husband_col_idx : int
+            Index of relationship_Husband column
+        wife_col_idx : int
+            Index of relationship_Wife column
+        unmarried_col_idx : int
+            Index of relationship_Unmarried column
         """
         if not SENSEI_AVAILABLE:
             raise ImportError(
@@ -452,7 +476,9 @@ class SenSeIPipeline:
         self.X_val = X_val
         self.y_val = y_val
         self.X_protected_train = X_protected_train
-        self.proxy_col_idx = proxy_col_idx
+        self.husband_col_idx = husband_col_idx
+        self.wife_col_idx = wife_col_idx
+        self.unmarried_col_idx = unmarried_col_idx
         
         # Device selection: CUDA (NVIDIA) > MPS (Mac) > CPU
         if torch.cuda.is_available():
@@ -558,8 +584,13 @@ class SenSeIPipeline:
             logits = network(X_val_t)
             y_pred = logits.argmax(dim=1).cpu().numpy()
             
-            # Counterfactual on proxy (following IBM's spouse_consistency)
-            X_val_flipped = create_flipped_data(self.X_val, self.proxy_col_idx)
+            # Counterfactual using improved sex proxy flip
+            X_val_flipped = create_flipped_data_sex_proxy(
+                self.X_val, 
+                self.husband_col_idx,
+                self.wife_col_idx,
+                self.unmarried_col_idx
+            )
             X_val_flipped_t = torch.FloatTensor(X_val_flipped).to(self.device)
             logits_flipped = network(X_val_flipped_t)
             y_pred_flipped = logits_flipped.argmax(dim=1).cpu().numpy()
@@ -655,16 +686,35 @@ def run_optimization(
             )
     else:
         # Approach 2: Without sensitive features
+        # Get relationship column indices for sex proxy flip
+        husband_idx = data['husband_col_idx']
+        wife_idx = data['wife_col_idx']
+        unmarried_idx = data['unmarried_col_idx']
+        
+        print(f"Using SEX PROXY flip (Husband/Wife/Unmarried columns)")
+        print(f"  Husband index: {husband_idx}, Wife index: {wife_idx}, Unmarried index: {unmarried_idx}")
+        
         if model_type == "sensei":
             if not SENSEI_AVAILABLE:
                 raise ImportError("SenSeI requires inFairness. Install with: pip install inFairness")
+            
+            # Get protected features (try both key names for compatibility)
+            if 'X_protected_train' in data and data['X_protected_train'] is not None:
+                X_protected = data['X_protected_train']
+            elif 'X_protected' in data and data['X_protected'] is not None:
+                X_protected = data['X_protected']
+            else:
+                raise ValueError("SenSeI requires 'X_protected' or 'X_protected_train' in data dict")
+
             pipeline = SenSeIPipeline(
                 X_train=data['X_train'],
                 y_train=data['y_train'],
                 X_val=data['X_val'],
                 y_val=data['y_val'],
-                X_protected_train=data['X_protected_train'],
-                proxy_col_idx=data['proxy_col_idx'],
+                X_protected_train=X_protected,
+                husband_col_idx=husband_idx,
+                wife_col_idx=wife_idx,
+                unmarried_col_idx=unmarried_idx,
             )
         else:
             pipeline = FairnessPipelineApproach2(
@@ -673,7 +723,9 @@ def run_optimization(
                 y_train=data['y_train'],
                 X_val=data['X_val'],
                 y_val=data['y_val'],
-                proxy_col_idx=data['proxy_col_idx'],
+                husband_col_idx=husband_idx,
+                wife_col_idx=wife_idx,
+                unmarried_col_idx=unmarried_idx,
             )
     
     # Define scenario
