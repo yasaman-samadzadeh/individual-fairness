@@ -812,7 +812,7 @@ def compute_fairness_confusion_matrix(
         - 'metrics': dict with derived metrics
     """
     # Import here to avoid circular imports
-    from utils.datasets import (
+    from datasets import (
         create_flipped_data,
         create_flipped_data_multiclass_exhaustive,
     )
@@ -1080,4 +1080,324 @@ def print_fairness_confusion_summary(results: Dict, model_name: str = "Model"):
         print(f"  → {unfair_correct_rate:.1%} of correct predictions are 'right but unfair'")
     
     print(f"{'='*70}\n")
+
+
+# =============================================================================
+# Notebook Display Helpers
+# =============================================================================
+
+def plot_sensitive_distribution(data, dataset_name, sensitive_feature):
+    """
+    Plot the distribution of sensitive feature(s) vs target variable with disparity analysis.
+    
+    Parameters
+    ----------
+    data : dict
+        Data dictionary containing X_train, y_train, and sensitive feature info
+    dataset_name : str
+        Name of the dataset (e.g., 'adult')
+    sensitive_feature : str
+        Name of the sensitive feature (e.g., 'sex', 'race')
+    """
+    X_train = data['X_train']
+    y_train = data['y_train']
+    
+    # Determine if binary or multiclass based on which keys exist
+    is_multiclass = 'sensitive_col_indices' in data
+    
+    # Get target label names (customize based on dataset)
+    target_names = {0: 'Income ≤50K', 1: 'Income >50K'} if dataset_name == 'adult' else {0: 'Class 0', 1: 'Class 1'}
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    if is_multiclass:
+        # Multiclass sensitive feature (e.g., race)
+        sens_indices = data['sensitive_col_indices']
+        sens_names = data.get('sensitive_col_names', [f'Cat_{i}' for i in range(len(sens_indices))])
+        n_categories = len(sens_names)
+        
+        # Determine which category each sample belongs to
+        categories = np.argmax(X_train[:, sens_indices], axis=1)
+        
+        # Count samples per category and target
+        category_target_counts = {}
+        for cat_idx, cat_name in enumerate(sens_names):
+            mask = (categories == cat_idx)
+            pos_count = (y_train[mask] == 1).sum()
+            neg_count = (y_train[mask] == 0).sum()
+            category_target_counts[cat_name] = {'positive': pos_count, 'negative': neg_count, 'total': mask.sum()}
+        
+        # Plot 1: Stacked bar chart (absolute counts)
+        cat_names = list(category_target_counts.keys())
+        pos_counts = [category_target_counts[c]['positive'] for c in cat_names]
+        neg_counts = [category_target_counts[c]['negative'] for c in cat_names]
+        
+        x = np.arange(len(cat_names))
+        width = 0.6
+        
+        axes[0].bar(x, neg_counts, width, label=target_names[0], color='#3498db', alpha=0.8)
+        axes[0].bar(x, pos_counts, width, bottom=neg_counts, label=target_names[1], color='#e74c3c', alpha=0.8)
+        
+        axes[0].set_xlabel(f'Sensitive Feature: {sensitive_feature.title()}', fontsize=11)
+        axes[0].set_ylabel('Count', fontsize=11)
+        axes[0].set_title('Distribution by Sensitive Group (Absolute)', fontsize=12, fontweight='bold')
+        axes[0].set_xticks(x)
+        axes[0].set_xticklabels(cat_names, rotation=45, ha='right')
+        axes[0].legend()
+        
+        # Add count labels
+        for i, (neg, pos) in enumerate(zip(neg_counts, pos_counts)):
+            axes[0].annotate(f'{neg+pos:,}', (i, neg+pos+50), ha='center', fontsize=9)
+        
+        # Plot 2: Base rate (percentage positive) per group
+        base_rates = [100 * category_target_counts[c]['positive'] / category_target_counts[c]['total'] 
+                      for c in cat_names]
+        
+        colors = plt.cm.RdYlGn_r(np.linspace(0.2, 0.8, len(cat_names)))
+        axes[1].bar(x, base_rates, width, color=colors, edgecolor='black', linewidth=0.5)
+        
+        axes[1].axhline(y=100*y_train.mean(), color='black', linestyle='--', linewidth=2, 
+                        label=f'Overall rate: {100*y_train.mean():.1f}%')
+        axes[1].set_xlabel(f'Sensitive Feature: {sensitive_feature.title()}', fontsize=11)
+        axes[1].set_ylabel(f'% {target_names[1]}', fontsize=11)
+        axes[1].set_title('Base Rate Disparity (% Positive Outcome)', fontsize=12, fontweight='bold')
+        axes[1].set_xticks(x)
+        axes[1].set_xticklabels(cat_names, rotation=45, ha='right')
+        axes[1].legend()
+        axes[1].set_ylim(0, max(base_rates) * 1.2)
+        
+        # Add percentage labels
+        for i, rate in enumerate(base_rates):
+            axes[1].annotate(f'{rate:.1f}%', (i, rate + 1), ha='center', fontsize=10, fontweight='bold')
+        
+        # For summary
+        grp_names = cat_names
+        counts = category_target_counts
+        sens_name = sensitive_feature
+
+    else:
+        # Binary sensitive feature (e.g., sex)
+        sens_idx = data['sensitive_col_idx']
+        sens_name = data.get('sensitive_col_name', sensitive_feature)
+        
+        # Get group labels (customize based on feature)
+        if 'sex' in sensitive_feature.lower():
+            group_names = {0: 'Female', 1: 'Male'}
+        else:
+            group_names = {0: f'{sens_name}=0', 1: f'{sens_name}=1'}
+        
+        # Count samples per group and target
+        group0_mask = (X_train[:, sens_idx] == 0)
+        group1_mask = (X_train[:, sens_idx] == 1)
+        
+        counts = {
+            group_names[0]: {'positive': int((y_train[group0_mask] == 1).sum()), 
+                             'negative': int((y_train[group0_mask] == 0).sum()),
+                             'total': int(group0_mask.sum())},
+            group_names[1]: {'positive': int((y_train[group1_mask] == 1).sum()), 
+                             'negative': int((y_train[group1_mask] == 0).sum()),
+                             'total': int(group1_mask.sum())}
+        }
+        
+        # Plot 1: Grouped bar chart
+        grp_names = list(counts.keys())
+        x = np.arange(len(grp_names))
+        width = 0.35
+        
+        neg_counts = [counts[g]['negative'] for g in grp_names]
+        pos_counts = [counts[g]['positive'] for g in grp_names]
+        
+        bars1 = axes[0].bar(x - width/2, neg_counts, width, label=target_names[0], color='#3498db', alpha=0.8)
+        bars2 = axes[0].bar(x + width/2, pos_counts, width, label=target_names[1], color='#e74c3c', alpha=0.8)
+        
+        axes[0].set_xlabel(f'Sensitive Feature: {sens_name}', fontsize=11)
+        axes[0].set_ylabel('Count', fontsize=11)
+        axes[0].set_title('Distribution by Sensitive Group', fontsize=12, fontweight='bold')
+        axes[0].set_xticks(x)
+        axes[0].set_xticklabels(grp_names)
+        axes[0].legend()
+        
+        # Add count labels
+        for bar in bars1:
+            axes[0].annotate(f'{int(bar.get_height()):,}', 
+                             (bar.get_x() + bar.get_width()/2, bar.get_height()),
+                             ha='center', va='bottom', fontsize=9)
+        for bar in bars2:
+            axes[0].annotate(f'{int(bar.get_height()):,}', 
+                             (bar.get_x() + bar.get_width()/2, bar.get_height()),
+                             ha='center', va='bottom', fontsize=9)
+        
+        # Plot 2: Base rate comparison
+        base_rates = [100 * counts[g]['positive'] / counts[g]['total'] for g in grp_names]
+        
+        colors = ['#9b59b6', '#1abc9c']
+        axes[1].bar(x, base_rates, width=0.5, color=colors, edgecolor='black', linewidth=1)
+        
+        axes[1].axhline(y=100*y_train.mean(), color='black', linestyle='--', linewidth=2, 
+                        label=f'Overall rate: {100*y_train.mean():.1f}%')
+        axes[1].set_xlabel(f'Sensitive Feature: {sens_name}', fontsize=11)
+        axes[1].set_ylabel(f'% {target_names[1]}', fontsize=11)
+        axes[1].set_title('Base Rate Disparity', fontsize=12, fontweight='bold')
+        axes[1].set_xticks(x)
+        axes[1].set_xticklabels(grp_names)
+        axes[1].legend()
+        axes[1].set_ylim(0, max(base_rates) * 1.3)
+        
+        # Add percentage labels
+        for i, rate in enumerate(base_rates):
+            axes[1].annotate(f'{rate:.1f}%', (i, rate + 1.5), ha='center', fontsize=12, fontweight='bold')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Print summary statistics
+    print("\n" + "="*60)
+    print("DISTRIBUTION SUMMARY")
+    print("="*60)
+    
+    if is_multiclass:
+        print(f"\nSensitive Feature: {sensitive_feature} ({n_categories} categories)")
+    else:
+        print(f"\nSensitive Feature: {sens_name}")
+    
+    print(f"{'Group':<15} {'Count':>10} {'% of Data':>12} {'Base Rate':>12}")
+    print("-"*50)
+    for grp_name in grp_names:
+        c = counts[grp_name]
+        pct_data = 100 * c['total'] / len(y_train)
+        base_rate = 100 * c['positive'] / c['total']
+        print(f"{grp_name:<15} {c['total']:>10,} {pct_data:>11.1f}% {base_rate:>11.1f}%")
+    
+    print("-"*50)
+    print(f"{'OVERALL':<15} {len(y_train):>10,} {'100.0%':>12} {100*y_train.mean():>11.1f}%")
+    
+    # Calculate disparity
+    rates = [counts[g]['positive'] / counts[g]['total'] for g in grp_names]
+    disparity_ratio = max(rates) / min(rates)
+    disparity_diff = 100 * (max(rates) - min(rates))
+    
+    print(f"\n📊 Disparity Analysis:")
+    print(f"   • Highest base rate: {100*max(rates):.1f}%")
+    print(f"   • Lowest base rate:  {100*min(rates):.1f}%")
+    print(f"   • Disparity ratio:   {disparity_ratio:.2f}x")
+    print(f"   • Absolute gap:      {disparity_diff:.1f} percentage points")
+
+
+def plot_and_display_pareto(results, dataset_name, sensitive_feature, output_dir, 
+                            get_pareto_front_fn=None):
+    """
+    Generate and display Pareto comparison plot.
+    
+    Parameters
+    ----------
+    results : dict
+        Dictionary mapping model_type -> smac optimizer
+    dataset_name : str
+        Name of the dataset
+    sensitive_feature : str
+        Name of the sensitive feature
+    output_dir : str
+        Directory to save plots
+    get_pareto_front_fn : callable, optional
+        Function to get Pareto front (imported if not provided)
+        
+    Returns
+    -------
+    dict
+        Paths to saved plots
+    """
+    pareto_filename = f"pareto_{dataset_name}_{sensitive_feature}.png"
+    pareto_paths = plot_pareto_comparison(
+        results, 
+        output_dir=output_dir,
+        filename=pareto_filename,
+        formats=["notebook", "latex"]
+    )
+    
+    return pareto_paths
+
+
+def plot_parallel_coords_all_models(results, dataset_name, sensitive_feature, output_dir,
+                                    get_configspace_fn=None):
+    """
+    Generate parallel coordinate plots for ALL models in results.
+    
+    Works for any number of models (rf, mlp, sensei, etc.)
+    
+    Parameters
+    ----------
+    results : dict
+        Dictionary mapping model_type -> smac optimizer
+    dataset_name : str
+        Name of the dataset
+    sensitive_feature : str
+        Name of the sensitive feature
+    output_dir : str
+        Directory to save plots
+    get_configspace_fn : callable
+        Function to get configspace for a model type
+        
+    Returns
+    -------
+    dict
+        Paths to all generated plots
+    """
+    paths = {}
+    
+    for model_type in results.keys():
+        filename = f"parallel_coords_{dataset_name}_{sensitive_feature}_{model_type}.png"
+        model_paths = plot_parallel_coordinates(
+            results[model_type], 
+            model_type,
+            get_configspace_fn=get_configspace_fn,
+            output_dir=output_dir,
+            filename=filename,
+            color_by='error',
+            formats=["notebook", "latex"]
+        )
+        paths[model_type] = model_paths
+    
+    return paths
+
+
+def plot_mds_all_models(results, dataset_name, sensitive_feature, output_dir,
+                        get_configspace_fn=None):
+    """
+    Generate MDS projection plots for ALL models in results.
+    
+    Works for any number of models (rf, mlp, sensei, etc.)
+    
+    Parameters
+    ----------
+    results : dict
+        Dictionary mapping model_type -> smac optimizer
+    dataset_name : str
+        Name of the dataset
+    sensitive_feature : str
+        Name of the sensitive feature
+    output_dir : str
+        Directory to save plots
+    get_configspace_fn : callable
+        Function to get configspace for a model type
+        
+    Returns
+    -------
+    dict
+        Paths to all generated plots
+    """
+    paths = {}
+    
+    for model_type in results.keys():
+        filename = f"mds_projection_{dataset_name}_{sensitive_feature}_{model_type}.png"
+        model_paths = plot_mds_projection(
+            results[model_type], 
+            model_type,
+            get_configspace_fn=get_configspace_fn,
+            output_dir=output_dir,
+            filename=filename,
+            formats=["notebook", "latex"]
+        )
+        paths[model_type] = model_paths
+    
+    return paths
 

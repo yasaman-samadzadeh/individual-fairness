@@ -40,7 +40,7 @@ from smac import Scenario
 from smac.facade.abstract_facade import AbstractFacade
 from smac.multi_objective.parego import ParEGO
 
-from utils.datasets import (
+from datasets import (
     load_dataset, 
     create_flipped_data,
     create_flipped_data_multiclass_exhaustive,
@@ -49,7 +49,7 @@ from utils.datasets import (
     list_available_datasets, 
     get_dataset_config
 )
-from utils.individual_fairness import counterfactual_consistency
+from metrics import counterfactual_consistency
 from utils.plotting import (
     get_pareto_front,
     get_pareto_indices,
