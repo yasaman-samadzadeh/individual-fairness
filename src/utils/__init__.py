@@ -25,6 +25,7 @@ from utils.plotting import (
     plot_and_display_pareto,
     plot_parallel_coords_all_models,
     plot_mds_all_models,
+    plot_case_study_visualizations,
 )
 from utils.analysis import (
     # Caching
@@ -38,6 +39,8 @@ from utils.analysis import (
     print_optimization_summary,
     analyze_fairness_confusion_matrix,
     analyze_trivial_fairness,
+    # Pareto point selection
+    select_balanced_pareto_point,
     setup_case_study_analysis,
     case_study_prediction_flip,
     case_study_consistent_sample,
@@ -74,6 +77,7 @@ __all__ = [
     "plot_and_display_pareto",
     "plot_parallel_coords_all_models",
     "plot_mds_all_models",
+    "plot_case_study_visualizations",
     # analysis - caching
     "save_smac_results",
     "load_smac_results",
@@ -85,6 +89,8 @@ __all__ = [
     "print_optimization_summary",
     "analyze_fairness_confusion_matrix",
     "analyze_trivial_fairness",
+    # pareto selection
+    "select_balanced_pareto_point",
     "setup_case_study_analysis",
     "case_study_prediction_flip",
     "case_study_consistent_sample",

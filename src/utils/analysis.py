@@ -59,6 +59,7 @@ class CachedRunHistory:
     def __init__(self, configs: List[Dict], costs: List[tuple]):
         self._configs = [CachedConfig(c) for c in configs]
         self._costs = {i: cost for i, cost in enumerate(costs)}
+        self._is_cached = True  # Flag to identify cached results
     
     def get_configs(self):
         return self._configs
@@ -66,6 +67,10 @@ class CachedRunHistory:
     def average_cost(self, config):
         idx = self._configs.index(config)
         return self._costs[idx]
+    
+    def items(self):
+        """Return empty iterator - cached results don't have timing info."""
+        return iter([])
 
 
 class CachedSMAC:
@@ -162,8 +167,8 @@ def load_smac_results(dataset_name: str, sensitive_feature: str,
 # =============================================================================
 
 def run_smac_optimization(data, dataset_name, sensitive_feature, 
-                          run_optimization_fn, save_smac_results_fn, load_smac_results_fn,
-                          load_from_cache=True, walltime_limit=300, n_trials=100):
+                          load_from_cache=True, walltime_limit=300, n_trials=100,
+                          output_dir="../smac_output"):
     """
     Run SMAC optimization or load from cache.
     
@@ -175,28 +180,27 @@ def run_smac_optimization(data, dataset_name, sensitive_feature,
         Name of the dataset
     sensitive_feature : str
         Name of the sensitive feature
-    run_optimization_fn : callable
-        Function to run SMAC optimization
-    save_smac_results_fn : callable
-        Function to save results to cache
-    load_smac_results_fn : callable
-        Function to load results from cache
     load_from_cache : bool
         Whether to try loading from cache first
     walltime_limit : int
         Time limit for optimization in seconds
     n_trials : int
         Number of trials for optimization
+    output_dir : str
+        Directory for SMAC output files
         
     Returns
     -------
     dict : Results dictionary with 'rf' and 'mlp' SMAC objects
     """
+    # Import run_optimization from main module
+    from main import run_optimization
+    
     results = None
     
     if load_from_cache:
         print(f"Loading results from cache for {dataset_name}/{sensitive_feature}...")
-        results = load_smac_results_fn(dataset_name, sensitive_feature, approach=1)
+        results = load_smac_results(dataset_name, sensitive_feature, approach=1)
         if results is not None:
             print(f"✓ Loaded from cache!")
             return results
@@ -211,12 +215,12 @@ def run_smac_optimization(data, dataset_name, sensitive_feature,
         print(f"Optimizing {model_type.upper()} (Sensitive: {sensitive_feature})...")
         print(f"{'='*60}")
         
-        smac = run_optimization_fn(
+        smac = run_optimization(
             model_type=model_type,
             data=data,
             walltime_limit=walltime_limit,
             n_trials=n_trials,
-            output_dir=f"../smac_output/{dataset_name}_{sensitive_feature}"
+            output_dir=f"{output_dir}/{dataset_name}_{sensitive_feature}"
         )
         results[model_type] = smac
     
@@ -225,12 +229,12 @@ def run_smac_optimization(data, dataset_name, sensitive_feature,
     print("="*60)
     
     # Save results to cache
-    save_smac_results_fn(results, dataset_name, sensitive_feature, approach=1)
+    save_smac_results(results, dataset_name, sensitive_feature, approach=1)
     
     return results
 
 
-def get_optimization_stats(smac, model_name, get_pareto_front_fn) -> Dict[str, Any]:
+def get_optimization_stats(smac, model_name) -> Dict[str, Any]:
     """
     Extract statistics from SMAC optimization run.
     
@@ -240,22 +244,35 @@ def get_optimization_stats(smac, model_name, get_pareto_front_fn) -> Dict[str, A
         SMAC optimizer object
     model_name : str
         Name of the model
-    get_pareto_front_fn : callable
-        Function to extract Pareto front
         
     Returns
     -------
     dict
         Statistics dictionary
     """
+    from main import get_pareto_front
+    
     runhistory = smac.runhistory
     
     # Number of configurations evaluated
     n_configs = len(runhistory.get_configs())
     
     # Get Pareto front size
-    pareto_configs, pareto_costs = get_pareto_front_fn(smac)
+    pareto_configs, pareto_costs = get_pareto_front(smac)
     n_incumbents = len(pareto_configs)
+    
+    # Check if this is a cached result (no timing info available)
+    is_cached = getattr(runhistory, '_is_cached', False)
+    
+    if is_cached:
+        # Cached results don't have timing information
+        return {
+            'Model': model_name.upper(),
+            'Configs Evaluated': n_configs,
+            'Pareto Front Size': n_incumbents,
+            'Total Time (s)': "(cached)",
+            'Avg Time/Config (s)': "(cached)",
+        }
     
     # Calculate total time and average time per config
     total_time = 0
@@ -274,7 +291,7 @@ def get_optimization_stats(smac, model_name, get_pareto_front_fn) -> Dict[str, A
     }
 
 
-def print_optimization_summary(results, dataset_name, sensitive_feature, get_pareto_front_fn):
+def print_optimization_summary(results, dataset_name, sensitive_feature):
     """
     Print optimization summary table and insights.
     
@@ -286,15 +303,14 @@ def print_optimization_summary(results, dataset_name, sensitive_feature, get_par
         Name of the dataset
     sensitive_feature : str
         Name of the sensitive feature
-    get_pareto_front_fn : callable
-        Function to extract Pareto front
     """
     import pandas as pd
+    from main import get_pareto_front
     
     # Build summary table
     summary_data = []
     for model_type, smac in results.items():
-        stats = get_optimization_stats(smac, model_type, get_pareto_front_fn)
+        stats = get_optimization_stats(smac, model_type)
         summary_data.append(stats)
     
     summary_df = pd.DataFrame(summary_data)
@@ -310,7 +326,7 @@ def print_optimization_summary(results, dataset_name, sensitive_feature, get_par
     print("=" * 70)
     for model_type, smac in results.items():
         n_configs = len(smac.runhistory.get_configs())
-        pareto_configs, _ = get_pareto_front_fn(smac)
+        pareto_configs, _ = get_pareto_front(smac)
         pareto_pct = len(pareto_configs) / n_configs * 100 if n_configs > 0 else 0
         print(f"{model_type.upper()}: {len(pareto_configs)}/{n_configs} configs are Pareto-optimal ({pareto_pct:.1f}%)")
 
@@ -320,10 +336,9 @@ def print_optimization_summary(results, dataset_name, sensitive_feature, get_par
 # =============================================================================
 
 def analyze_fairness_confusion_matrix(results, data, dataset_name, sensitive_feature, output_dir,
-                                      get_pareto_front_fn, create_rf_model_fn, create_mlp_model_fn,
-                                      compute_fcm_fn, plot_fcm_fn, print_fcm_summary_fn):
+                                       selection_method='knee'):
     """
-    Analyze fairness-accuracy confusion matrix for best-accuracy configs.
+    Analyze fairness-accuracy confusion matrix for selected Pareto configurations.
     
     Trains models on training set, evaluates on validation set.
     
@@ -339,74 +354,88 @@ def analyze_fairness_confusion_matrix(results, data, dataset_name, sensitive_fea
         Name of the sensitive feature
     output_dir : str
         Directory to save plots
-    get_pareto_front_fn : callable
-        Function to get Pareto front
-    create_rf_model_fn : callable
-        Function to create RF model from config
-    create_mlp_model_fn : callable
-        Function to create MLP model from config
-    compute_fcm_fn : callable
-        Function to compute fairness confusion matrix
-    plot_fcm_fn : callable
-        Function to plot fairness confusion matrix
-    print_fcm_summary_fn : callable
-        Function to print FCM summary
+    selection_method : str
+        Method to select Pareto point: 'knee' (balanced), 'best_accuracy', 'utopia', 'weighted'
         
     Returns
     -------
     dict
         FCM results and plot paths for each model
     """
+    from main import get_pareto_front, create_rf_model, create_mlp_model
+    from utils.plotting import compute_fairness_confusion_matrix, plot_fairness_confusion_matrix, print_fairness_confusion_summary
+    
     is_multiclass = 'sensitive_col_indices' in data
     all_results = {}
+    
+    # Describe selection method
+    method_descriptions = {
+        'knee': 'Knee-Optimal (Balanced)',
+        'best_accuracy': 'Best Accuracy',
+        'utopia': 'Closest to Utopia',
+        'weighted': 'Weighted (50-50)',
+    }
+    method_desc = method_descriptions.get(selection_method, selection_method)
     
     for model_type in ["rf", "mlp"]:
         if model_type not in results:
             continue
             
         print(f"\n{'='*70}")
-        print(f"Analyzing {model_type.upper()} - Best Accuracy Configuration")
+        print(f"Analyzing {model_type.upper()} - {method_desc} Configuration")
         print(f"{'='*70}")
         
-        # Get best accuracy config from Pareto front
-        configs, costs = get_pareto_front_fn(results[model_type])
-        best_acc_idx = np.argmin(costs[:, 0])  # Lowest error = best accuracy
-        best_config = configs[best_acc_idx]
+        # Get config from Pareto front based on selection method
+        configs, costs = get_pareto_front(results[model_type])
         
-        print(f"Accuracy: {1 - costs[best_acc_idx, 0]:.4f}")
-        print(f"Consistency: {1 - costs[best_acc_idx, 1]:.4f}")
+        if selection_method == 'best_accuracy':
+            selected_idx = np.argmin(costs[:, 0])  # Lowest error = best accuracy
+            selected_config = configs[selected_idx]
+            accuracy = 1 - costs[selected_idx, 0]
+            consistency = 1 - costs[selected_idx, 1]
+        else:
+            # Use balanced selection (knee, utopia, or weighted)
+            selected_idx, info = select_balanced_pareto_point(configs, costs, method=selection_method)
+            selected_config = configs[selected_idx]
+            accuracy = info['accuracy']
+            consistency = info['consistency']
+        
+        print(f"Selection method: {method_desc}")
+        print(f"Accuracy: {accuracy:.4f}")
+        print(f"Consistency: {consistency:.4f}")
         
         # Create and train the model on TRAINING set
         if model_type == "rf":
-            model = create_rf_model_fn(best_config)
+            model = create_rf_model(selected_config)
         else:
-            model = create_mlp_model_fn(best_config)
+            model = create_mlp_model(selected_config)
         
         model.fit(data['X_train'], data['y_train'])
         
         # Compute fairness confusion matrix on VALIDATION set
         if is_multiclass:
-            fcm_results = compute_fcm_fn(
+            fcm_results = compute_fairness_confusion_matrix(
                 model, data['X_val'], data['y_val'],
                 sensitive_col_indices=data['sensitive_col_indices'],
                 is_multiclass=True
             )
         else:
-            fcm_results = compute_fcm_fn(
+            fcm_results = compute_fairness_confusion_matrix(
                 model, data['X_val'], data['y_val'],
                 sensitive_col_idx=data['sensitive_col_idx'],
                 is_multiclass=False
             )
         
         # Print summary
-        print_fcm_summary_fn(fcm_results, f"{model_type.upper()} (Best Accuracy)")
+        print_fairness_confusion_summary(fcm_results, f"{model_type.upper()} ({method_desc})")
         
         # Plot and save
-        fcm_paths = plot_fcm_fn(
+        method_suffix = selection_method.replace(' ', '_').lower()
+        fcm_paths = plot_fairness_confusion_matrix(
             fcm_results,
-            model_name=f"{model_type.upper()} (Best Accuracy)",
+            model_name=f"{model_type.upper()} ({method_desc})",
             output_dir=output_dir,
-            filename=f"fairness_confusion_{dataset_name}_{sensitive_feature}_{model_type}_best_acc.png",
+            filename=f"fairness_confusion_{dataset_name}_{sensitive_feature}_{model_type}_{method_suffix}.png",
             formats=["notebook", "latex"]
         )
         
@@ -414,9 +443,10 @@ def analyze_fairness_confusion_matrix(results, data, dataset_name, sensitive_fea
         display(Image(filename=fcm_paths["notebook"]))
         
         all_results[model_type] = {
-            'config': best_config,
-            'accuracy': 1 - costs[best_acc_idx, 0],
-            'consistency': 1 - costs[best_acc_idx, 1],
+            'config': selected_config,
+            'accuracy': accuracy,
+            'consistency': consistency,
+            'selection_method': selection_method,
             'fcm': fcm_results,
             'paths': fcm_paths
         }
@@ -428,7 +458,7 @@ def analyze_fairness_confusion_matrix(results, data, dataset_name, sensitive_fea
 # Trivial Fairness Analysis
 # =============================================================================
 
-def analyze_trivial_fairness(results, data, get_pareto_front_fn, model_type='mlp'):
+def analyze_trivial_fairness(results, data, model_type='mlp'):
     """
     Investigate potentially degenerate 'trivially fair' configurations.
     
@@ -440,8 +470,6 @@ def analyze_trivial_fairness(results, data, get_pareto_front_fn, model_type='mlp
         SMAC results dictionary
     data : dict
         Data dictionary with X_train, y_train, X_val, y_val
-    get_pareto_front_fn : callable
-        Function to get Pareto front
     model_type : str
         Model type to analyze (default: 'mlp')
     
@@ -452,13 +480,14 @@ def analyze_trivial_fairness(results, data, get_pareto_front_fn, model_type='mlp
     """
     from sklearn.neural_network import MLPClassifier
     from sklearn.metrics import balanced_accuracy_score
+    from main import get_pareto_front
     
     if model_type not in results:
         print(f"No {model_type} results found.")
         return None
     
     # Get the fairest MLP config from Pareto front
-    configs, costs = get_pareto_front_fn(results[model_type])
+    configs, costs = get_pareto_front(results[model_type])
     best_fair_idx = np.argmin(costs[:, 1])  # Lowest inconsistency
     fair_config = configs[best_fair_idx]
     
@@ -555,12 +584,83 @@ def analyze_trivial_fairness(results, data, get_pareto_front_fn, model_type='mlp
 
 
 # =============================================================================
+# Pareto Point Selection
+# =============================================================================
+
+def select_balanced_pareto_point(configs, costs, method='knee'):
+    """
+    Select a balanced point from the Pareto front.
+    
+    Parameters
+    ----------
+    configs : list
+        Pareto configurations
+    costs : np.ndarray
+        Cost matrix (n_points, 2) where columns are [error, inconsistency]
+    method : str
+        'knee' - maximum curvature point (recommended)
+        'utopia' - closest to ideal point  
+        'weighted' - weighted sum with w=0.5
+        
+    Returns
+    -------
+    int : index of selected point
+    dict : selection info with accuracy, consistency, and method used
+    """
+    # Convert costs to objectives (higher is better)
+    accuracy = 1 - costs[:, 0]
+    consistency = 1 - costs[:, 1]
+    
+    # Handle edge case: only one point
+    if len(configs) == 1:
+        return 0, {
+            'method': method,
+            'accuracy': accuracy[0],
+            'consistency': consistency[0],
+        }
+    
+    # Normalize to [0, 1] for comparison
+    acc_range = accuracy.max() - accuracy.min()
+    con_range = consistency.max() - consistency.min()
+    
+    acc_norm = (accuracy - accuracy.min()) / (acc_range + 1e-10)
+    con_norm = (consistency - consistency.min()) / (con_range + 1e-10)
+    
+    if method == 'knee':
+        # Find point with maximum perpendicular distance from line connecting extremes
+        # This is the "knee" or "elbow" point where trade-off is most balanced
+        # Distance = (acc_norm + con_norm - 1) / sqrt(2) for line from (0,1) to (1,0)
+        distances = (acc_norm + con_norm - 1) / np.sqrt(2)
+        best_idx = np.argmax(distances)
+        
+    elif method == 'utopia':
+        # Distance to utopia point (1, 1) in normalized space
+        distances = np.sqrt((1 - acc_norm)**2 + (1 - con_norm)**2)
+        best_idx = np.argmin(distances)
+        
+    elif method == 'weighted':
+        # Equal weights (0.5 each)
+        scores = 0.5 * acc_norm + 0.5 * con_norm
+        best_idx = np.argmax(scores)
+    
+    else:
+        raise ValueError(f"Unknown method: {method}. Use 'knee', 'utopia', or 'weighted'.")
+    
+    return best_idx, {
+        'method': method,
+        'accuracy': accuracy[best_idx],
+        'consistency': consistency[best_idx],
+        'all_accuracies': accuracy,
+        'all_consistencies': consistency,
+    }
+
+
+# =============================================================================
 # Case Study Setup
 # =============================================================================
 
 def setup_case_study_analysis(results, data, dataset_name, sensitive_feature,
-                              get_pareto_front_fn, create_rf_model_fn, create_mlp_model_fn,
-                              create_flipped_data_fn):
+                              selection_method='best_accuracy'):
     """
     Setup for case study analysis: train models and compute counterfactual predictions.
     
@@ -574,39 +674,56 @@ def setup_case_study_analysis(results, data, dataset_name, sensitive_feature,
         Name of the dataset
     sensitive_feature : str
         Name of the sensitive feature
-    get_pareto_front_fn : callable
-        Function to get Pareto front
-    create_rf_model_fn : callable
-        Function to create RF model
-    create_mlp_model_fn : callable
-        Function to create MLP model
-    create_flipped_data_fn : callable
-        Function to create counterfactual data
+    selection_method : str
+        Method to select Pareto point: 'best_accuracy' (default), 'knee', 'utopia', 'weighted'
         
     Returns
     -------
     dict
         All computed values needed for case studies
     """
-    from datasets import create_flipped_data_multiclass_exhaustive
+    from datasets import create_flipped_data_multiclass_exhaustive, create_flipped_data
+    from main import get_pareto_front, create_rf_model, create_mlp_model
     
-    # Get best accuracy configs from Pareto front
-    rf_configs, rf_costs = get_pareto_front_fn(results['rf'])
-    mlp_configs, mlp_costs = get_pareto_front_fn(results['mlp'])
+    # Describe selection method
+    method_descriptions = {
+        'knee': 'Knee-Optimal (Balanced)',
+        'best_accuracy': 'Best Accuracy',
+        'utopia': 'Closest to Utopia',
+        'weighted': 'Weighted (50-50)',
+    }
+    method_desc = method_descriptions.get(selection_method, selection_method)
     
-    rf_best_acc_idx = np.argmin(rf_costs[:, 0])
-    mlp_best_acc_idx = np.argmin(mlp_costs[:, 0])
+    # Get configs from Pareto front
+    rf_configs, rf_costs = get_pareto_front(results['rf'])
+    mlp_configs, mlp_costs = get_pareto_front(results['mlp'])
     
-    rf_config = rf_configs[rf_best_acc_idx]
-    mlp_config = mlp_configs[mlp_best_acc_idx]
+    # Select config based on method
+    if selection_method == 'best_accuracy':
+        rf_idx = np.argmin(rf_costs[:, 0])
+        mlp_idx = np.argmin(mlp_costs[:, 0])
+        rf_accuracy = 1 - rf_costs[rf_idx, 0]
+        rf_consistency = 1 - rf_costs[rf_idx, 1]
+        mlp_accuracy = 1 - mlp_costs[mlp_idx, 0]
+        mlp_consistency = 1 - mlp_costs[mlp_idx, 1]
+    else:
+        rf_idx, rf_info = select_balanced_pareto_point(rf_configs, rf_costs, method=selection_method)
+        mlp_idx, mlp_info = select_balanced_pareto_point(mlp_configs, mlp_costs, method=selection_method)
+        rf_accuracy = rf_info['accuracy']
+        rf_consistency = rf_info['consistency']
+        mlp_accuracy = mlp_info['accuracy']
+        mlp_consistency = mlp_info['consistency']
     
-    print("Selected Models (Best Accuracy from Pareto Front):")
-    print(f"  RF:  Accuracy={1-rf_costs[rf_best_acc_idx, 0]:.4f}, Consistency={1-rf_costs[rf_best_acc_idx, 1]:.4f}")
-    print(f"  MLP: Accuracy={1-mlp_costs[mlp_best_acc_idx, 0]:.4f}, Consistency={1-mlp_costs[mlp_best_acc_idx, 1]:.4f}")
+    rf_config = rf_configs[rf_idx]
+    mlp_config = mlp_configs[mlp_idx]
+    
+    print(f"Selected Models ({method_desc} from Pareto Front):")
+    print(f"  RF:  Accuracy={rf_accuracy:.4f}, Consistency={rf_consistency:.4f}")
+    print(f"  MLP: Accuracy={mlp_accuracy:.4f}, Consistency={mlp_consistency:.4f}")
     
     # Create and train models on TRAINING set
-    rf_model = create_rf_model_fn(rf_config)
-    mlp_model = create_mlp_model_fn(mlp_config)
+    rf_model = create_rf_model(rf_config)
+    mlp_model = create_mlp_model(mlp_config)
     
     rf_model.fit(data['X_train'], data['y_train'])
     mlp_model.fit(data['X_train'], data['y_train'])
@@ -686,7 +803,7 @@ def setup_case_study_analysis(results, data, dataset_name, sensitive_feature,
         
     else:
         # Binary case
-        X_val_flipped = create_flipped_data_fn(X_val, data['sensitive_col_idx'])
+        X_val_flipped = create_flipped_data(X_val, data['sensitive_col_idx'])
         
         rf_pred_flip = rf_model.predict(X_val_flipped)
         rf_proba_flip = rf_model.predict_proba(X_val_flipped)[:, 1]

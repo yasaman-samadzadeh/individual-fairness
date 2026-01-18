@@ -253,6 +253,7 @@ def plot_pareto_comparison(
     output_dir: str = "plots",
     filename: str = "pareto_comparison.png",
     formats: List[PlotFormat] = ["notebook", "latex"],
+    show_knee_point: bool = True,
 ) -> Dict[str, str]:
     """
     Plot Pareto fronts for multiple models.
@@ -260,6 +261,7 @@ def plot_pareto_comparison(
     Creates a figure with:
     - Top row: Individual subplots for each model
     - Bottom row: Combined plot with all models overlaid
+    - Optionally marks the knee-optimal (balanced) point on each Pareto front
     
     Parameters
     ----------
@@ -271,6 +273,8 @@ def plot_pareto_comparison(
         Filename for the plot (without path)
     formats : list
         List of formats to generate ("notebook", "latex", or both)
+    show_knee_point : bool
+        Whether to highlight the knee-optimal point on each Pareto front (default: True)
     
     Returns
     -------
@@ -296,8 +300,10 @@ def plot_pareto_comparison(
         individual_axes = [fig.add_subplot(gs[0, i]) for i in range(n_models)]
         combined_ax = fig.add_subplot(gs[1, :])
         
-        def plot_model_data(ax, model_type, smac, show_legend=True, title=None):
+        def plot_model_data(ax, model_type, smac, show_legend=True, title=None, mark_knee=True):
             """Plot data for a single model on the given axis."""
+            from utils.analysis import select_balanced_pareto_point
+            
             color = MODEL_COLORS.get(model_type, '#7f7f7f')
             light_color = _get_light_color(color)
             marker = MODEL_MARKERS.get(model_type, 'o')
@@ -333,6 +339,34 @@ def plot_pareto_comparison(
                     label=f'{model_type.upper()} (Pareto Front)' if show_legend else None,
                     zorder=3
                 )
+                
+                # Mark knee-optimal point
+                if mark_knee and show_knee_point and len(pareto_configs) > 1:
+                    knee_idx, knee_info = select_balanced_pareto_point(pareto_configs, pareto_costs, method='knee')
+                    knee_acc = knee_info['accuracy']
+                    knee_con = knee_info['consistency']
+                    
+                    # Plot knee point with star marker
+                    ax.scatter(
+                        [knee_acc], [knee_con],
+                        c='gold', marker='*',
+                        s=400, edgecolors='black', linewidths=2,
+                        label=f'{model_type.upper()} Knee-Optimal' if show_legend else None,
+                        zorder=5
+                    )
+                    
+                    # Add annotation with just the values
+                    ax.annotate(
+                        f'({knee_acc:.2%}, {knee_con:.2%})',
+                        xy=(knee_acc, knee_con),
+                        xytext=(12, 12),
+                        textcoords='offset points',
+                        fontsize=8,
+                        ha='left',
+                        bbox=dict(boxstyle='round,pad=0.2', facecolor='lightyellow', edgecolor='gray', alpha=0.8),
+                        arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0.2', color='gray'),
+                        zorder=6
+                    )
             
             font_scale = settings["font_scale"]
             ax.set_xlabel('Balanced Accuracy', fontsize=11 * font_scale)
@@ -345,17 +379,18 @@ def plot_pareto_comparison(
             if show_legend:
                 ax.legend(loc='lower left', fontsize=9 * font_scale)
         
-        # Plot individual models
+        # Plot individual models (no knee point markers)
         for i, model_type in enumerate(model_names):
             plot_model_data(
                 individual_axes[i], model_type, results[model_type],
                 show_legend=True,
-                title=f'{model_type.upper()} Pareto Front'
+                title=f'{model_type.upper()} Pareto Front',
+                mark_knee=False  # Only show knee on combined plot
             )
         
-        # Plot combined
+        # Plot combined (with knee point markers)
         for model_type, smac in results.items():
-            plot_model_data(combined_ax, model_type, smac, show_legend=True)
+            plot_model_data(combined_ax, model_type, smac, show_legend=True, mark_knee=True)
         
         if settings["show_title"]:
             combined_ax.set_title('Combined Pareto Front Comparison', 
@@ -1284,7 +1319,7 @@ def plot_sensitive_distribution(data, dataset_name, sensitive_feature):
 
 
 def plot_and_display_pareto(results, dataset_name, sensitive_feature, output_dir, 
-                            get_pareto_front_fn=None):
+                            get_pareto_front_fn=None, show_knee_point=True):
     """
     Generate and display Pareto comparison plot.
     
@@ -1300,19 +1335,29 @@ def plot_and_display_pareto(results, dataset_name, sensitive_feature, output_dir
         Directory to save plots
     get_pareto_front_fn : callable, optional
         Function to get Pareto front (imported if not provided)
+    show_knee_point : bool
+        Whether to highlight the knee-optimal point on each Pareto front (default: True)
         
     Returns
     -------
     dict
         Paths to saved plots
     """
+    from IPython.display import Image, display
+    
     pareto_filename = f"pareto_{dataset_name}_{sensitive_feature}.png"
     pareto_paths = plot_pareto_comparison(
         results, 
         output_dir=output_dir,
         filename=pareto_filename,
-        formats=["notebook", "latex"]
+        formats=["notebook", "latex"],
+        show_knee_point=show_knee_point
     )
+    
+    # Display the notebook version
+    if "notebook" in pareto_paths:
+        print(f"\nPareto Front - {dataset_name} ({sensitive_feature}):")
+        display(Image(filename=pareto_paths["notebook"]))
     
     return pareto_paths
 
@@ -1320,7 +1365,7 @@ def plot_and_display_pareto(results, dataset_name, sensitive_feature, output_dir
 def plot_parallel_coords_all_models(results, dataset_name, sensitive_feature, output_dir,
                                     get_configspace_fn=None):
     """
-    Generate parallel coordinate plots for ALL models in results.
+    Generate and display parallel coordinate plots for ALL models in results.
     
     Works for any number of models (rf, mlp, sensei, etc.)
     
@@ -1334,14 +1379,21 @@ def plot_parallel_coords_all_models(results, dataset_name, sensitive_feature, ou
         Name of the sensitive feature
     output_dir : str
         Directory to save plots
-    get_configspace_fn : callable
-        Function to get configspace for a model type
+    get_configspace_fn : callable, optional
+        Function to get configspace for a model type (imported from main if not provided)
         
     Returns
     -------
     dict
         Paths to all generated plots
     """
+    from IPython.display import Image, display
+    
+    # Import get_configspace if not provided
+    if get_configspace_fn is None:
+        from main import get_configspace
+        get_configspace_fn = get_configspace
+    
     paths = {}
     
     for model_type in results.keys():
@@ -1356,6 +1408,11 @@ def plot_parallel_coords_all_models(results, dataset_name, sensitive_feature, ou
             formats=["notebook", "latex"]
         )
         paths[model_type] = model_paths
+        
+        # Display the notebook version
+        if "notebook" in model_paths:
+            print(f"\n{model_type.upper()} - Parallel Coordinate Plot:")
+            display(Image(filename=model_paths["notebook"]))
     
     return paths
 
@@ -1363,7 +1420,7 @@ def plot_parallel_coords_all_models(results, dataset_name, sensitive_feature, ou
 def plot_mds_all_models(results, dataset_name, sensitive_feature, output_dir,
                         get_configspace_fn=None):
     """
-    Generate MDS projection plots for ALL models in results.
+    Generate and display MDS projection plots for ALL models in results.
     
     Works for any number of models (rf, mlp, sensei, etc.)
     
@@ -1377,14 +1434,21 @@ def plot_mds_all_models(results, dataset_name, sensitive_feature, output_dir,
         Name of the sensitive feature
     output_dir : str
         Directory to save plots
-    get_configspace_fn : callable
-        Function to get configspace for a model type
+    get_configspace_fn : callable, optional
+        Function to get configspace for a model type (imported from main if not provided)
         
     Returns
     -------
     dict
         Paths to all generated plots
     """
+    from IPython.display import Image, display
+    
+    # Import get_configspace if not provided
+    if get_configspace_fn is None:
+        from main import get_configspace
+        get_configspace_fn = get_configspace
+    
     paths = {}
     
     for model_type in results.keys():
@@ -1398,6 +1462,104 @@ def plot_mds_all_models(results, dataset_name, sensitive_feature, output_dir,
             formats=["notebook", "latex"]
         )
         paths[model_type] = model_paths
+        
+        # Display the notebook version
+        if "notebook" in model_paths:
+            print(f"\n{model_type.upper()} - MDS Projection:")
+            display(Image(filename=model_paths["notebook"]))
     
     return paths
+
+
+def plot_case_study_visualizations(cs, dataset_name, sensitive_feature, output_dir):
+    """
+    Generate case study visualizations: probability sensitivity and counterfactual scatter.
+    """
+    rf_proba_change = cs['rf_proba_change']
+    mlp_proba_change = cs['mlp_proba_change']
+    rf_proba_orig = cs['rf_proba_orig']
+    mlp_proba_orig = cs['mlp_proba_orig']
+    rf_inconsistent = cs['rf_inconsistent']
+    mlp_inconsistent = cs['mlp_inconsistent']
+    is_multiclass = cs['is_multiclass']
+    
+    # --- Plot 1: Probability Change Distribution ---
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    axes[0].hist(rf_proba_change, bins=50, edgecolor='black', alpha=0.7, color='#2E86AB')
+    axes[0].axvline(x=rf_proba_change.mean(), color='red', linestyle='--', linewidth=2, 
+                    label=f'Mean: {rf_proba_change.mean():.3f}')
+    axes[0].set_xlabel('|ΔP| when sensitive attribute flipped', fontsize=12)
+    axes[0].set_ylabel('Number of Samples', fontsize=12)
+    axes[0].set_title(f'Random Forest: Sensitivity Distribution ({sensitive_feature})', fontsize=14)
+    axes[0].legend()
+    
+    axes[1].hist(mlp_proba_change, bins=50, edgecolor='black', alpha=0.7, color='#A23B72')
+    axes[1].axvline(x=mlp_proba_change.mean(), color='red', linestyle='--', linewidth=2,
+                    label=f'Mean: {mlp_proba_change.mean():.3f}')
+    axes[1].set_xlabel('|ΔP| when sensitive attribute flipped', fontsize=12)
+    axes[1].set_ylabel('Number of Samples', fontsize=12)
+    axes[1].set_title(f'MLP: Sensitivity Distribution ({sensitive_feature})', fontsize=14)
+    axes[1].legend()
+    
+    plt.tight_layout()
+    plt.savefig(f'{output_dir}/notebook/probability_sensitivity_{dataset_name}_{sensitive_feature}.png', dpi=150, bbox_inches='tight')
+    plt.savefig(f'{output_dir}/latex/probability_sensitivity_{dataset_name}_{sensitive_feature}.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    print(f"RF:  Mean |ΔP| = {rf_proba_change.mean():.4f}, Max = {rf_proba_change.max():.4f}")
+    print(f"MLP: Mean |ΔP| = {mlp_proba_change.mean():.4f}, Max = {mlp_proba_change.max():.4f}")
+    
+    # --- Plot 2: Counterfactual Scatter ---
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    
+    if is_multiclass:
+        rf_proba_flip_viz = np.array([cs['rf_probas_flipped'][cs['rf_max_flip_target'][i]][i] for i in range(len(rf_proba_orig))])
+        mlp_proba_flip_viz = np.array([cs['mlp_probas_flipped'][cs['mlp_max_flip_target'][i]][i] for i in range(len(mlp_proba_orig))])
+    else:
+        rf_proba_flip_viz = cs['rf_proba_flip']
+        mlp_proba_flip_viz = cs['mlp_proba_flip']
+    
+    # RF scatter
+    scatter1 = axes[0].scatter(rf_proba_orig, rf_proba_flip_viz, 
+                               c=rf_inconsistent.astype(int), cmap='coolwarm',
+                               alpha=0.5, s=10)
+    axes[0].plot([0, 1], [0, 1], 'k--', linewidth=2, label='Perfect consistency')
+    axes[0].axhline(y=0.5, color='gray', linestyle=':', alpha=0.5)
+    axes[0].axvline(x=0.5, color='gray', linestyle=':', alpha=0.5)
+    axes[0].set_xlabel('P(class=1) - Original', fontsize=12)
+    axes[0].set_ylabel('P(class=1) - Flipped', fontsize=12)
+    axes[0].set_title(f'Random Forest: Counterfactual Analysis ({sensitive_feature})', fontsize=14)
+    axes[0].legend()
+    axes[0].set_xlim(0, 1)
+    axes[0].set_ylim(0, 1)
+    
+    # MLP scatter
+    scatter2 = axes[1].scatter(mlp_proba_orig, mlp_proba_flip_viz,
+                               c=mlp_inconsistent.astype(int), cmap='coolwarm',
+                               alpha=0.5, s=10)
+    axes[1].plot([0, 1], [0, 1], 'k--', linewidth=2, label='Perfect consistency')
+    axes[1].axhline(y=0.5, color='gray', linestyle=':', alpha=0.5)
+    axes[1].axvline(x=0.5, color='gray', linestyle=':', alpha=0.5)
+    axes[1].set_xlabel('P(class=1) - Original', fontsize=12)
+    axes[1].set_ylabel('P(class=1) - Flipped', fontsize=12)
+    axes[1].set_title(f'MLP: Counterfactual Analysis ({sensitive_feature})', fontsize=14)
+    axes[1].legend()
+    axes[1].set_xlim(0, 1)
+    axes[1].set_ylim(0, 1)
+    
+    cbar = plt.colorbar(scatter2, ax=axes[1])
+    cbar.set_label('Prediction Flipped', fontsize=10)
+    cbar.set_ticks([0, 1])
+    cbar.set_ticklabels(['No', 'Yes'])
+    
+    plt.tight_layout()
+    plt.savefig(f'{output_dir}/notebook/counterfactual_scatter_{dataset_name}_{sensitive_feature}.png', dpi=150, bbox_inches='tight')
+    plt.savefig(f'{output_dir}/latex/counterfactual_scatter_{dataset_name}_{sensitive_feature}.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    print("Blue = consistent (fair), Red = prediction flipped (unfair)")
+    print("Points in upper-left/lower-right quadrants crossed the decision boundary")
+    if is_multiclass:
+        print("(For multiclass: showing probability change to max-change target category)")
 
