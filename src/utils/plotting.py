@@ -1022,10 +1022,10 @@ def plot_fairness_confusion_matrix(
         # Add text annotations
         total = counts['total']
         annotations = [
-            [f"{matrix[0,0]}\n({100*matrix[0,0]/total:.1f}%)\n✅ Ideal",
-             f"{matrix[0,1]}\n({100*matrix[0,1]/total:.1f}%)\n⚠️ Unfair"],
-            [f"{matrix[1,0]}\n({100*matrix[1,0]/total:.1f}%)\n🔸 Fair Error",
-             f"{matrix[1,1]}\n({100*matrix[1,1]/total:.1f}%)\n❌ Worst"],
+            [f"{matrix[0,0]}\n({100*matrix[0,0]/total:.1f}%)\n[IDEAL]",
+             f"{matrix[0,1]}\n({100*matrix[0,1]/total:.1f}%)\n[UNFAIR]"],
+            [f"{matrix[1,0]}\n({100*matrix[1,0]/total:.1f}%)\n[FAIR ERROR]",
+             f"{matrix[1,1]}\n({100*matrix[1,1]/total:.1f}%)\n[WORST]"],
         ]
         
         for i in range(2):
@@ -1151,18 +1151,16 @@ def plot_sensitive_distribution(data, dataset_name, sensitive_feature, output_di
     # Get target label names (customize based on dataset)
     target_names = {0: 'Income ≤50K', 1: 'Income >50K'} if dataset_name == 'adult' else {0: 'Class 0', 1: 'Class 1'}
     
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    filename = f"distribution_{dataset_name}_{sensitive_feature}.png"
+    saved_paths = {}
     
+    # Pre-compute data for both formats
     if is_multiclass:
-        # Multiclass sensitive feature (e.g., race)
         sens_indices = data['sensitive_col_indices']
         sens_names = data.get('sensitive_col_names', [f'Cat_{i}' for i in range(len(sens_indices))])
         n_categories = len(sens_names)
-        
-        # Determine which category each sample belongs to
         categories = np.argmax(X_train[:, sens_indices], axis=1)
         
-        # Count samples per category and target
         category_target_counts = {}
         for cat_idx, cat_name in enumerate(sens_names):
             mask = (categories == cat_idx)
@@ -1170,66 +1168,18 @@ def plot_sensitive_distribution(data, dataset_name, sensitive_feature, output_di
             neg_count = (y_train[mask] == 0).sum()
             category_target_counts[cat_name] = {'positive': pos_count, 'negative': neg_count, 'total': mask.sum()}
         
-        # Plot 1: Stacked bar chart (absolute counts)
-        cat_names = list(category_target_counts.keys())
-        pos_counts = [category_target_counts[c]['positive'] for c in cat_names]
-        neg_counts = [category_target_counts[c]['negative'] for c in cat_names]
-        
-        x = np.arange(len(cat_names))
-        width = 0.6
-        
-        axes[0].bar(x, neg_counts, width, label=target_names[0], color='#3498db', alpha=0.8)
-        axes[0].bar(x, pos_counts, width, bottom=neg_counts, label=target_names[1], color='#e74c3c', alpha=0.8)
-        
-        axes[0].set_xlabel(f'Sensitive Feature: {sensitive_feature.title()}', fontsize=11)
-        axes[0].set_ylabel('Count', fontsize=11)
-        axes[0].set_title('Distribution by Sensitive Group (Absolute)', fontsize=12, fontweight='bold')
-        axes[0].set_xticks(x)
-        axes[0].set_xticklabels(cat_names, rotation=45, ha='right')
-        axes[0].legend()
-        
-        # Add count labels
-        for i, (neg, pos) in enumerate(zip(neg_counts, pos_counts)):
-            axes[0].annotate(f'{neg+pos:,}', (i, neg+pos+50), ha='center', fontsize=9)
-        
-        # Plot 2: Base rate (percentage positive) per group
-        base_rates = [100 * category_target_counts[c]['positive'] / category_target_counts[c]['total'] 
-                      for c in cat_names]
-        
-        colors = plt.cm.RdYlGn_r(np.linspace(0.2, 0.8, len(cat_names)))
-        axes[1].bar(x, base_rates, width, color=colors, edgecolor='black', linewidth=0.5)
-        
-        axes[1].axhline(y=100*y_train.mean(), color='black', linestyle='--', linewidth=2, 
-                        label=f'Overall rate: {100*y_train.mean():.1f}%')
-        axes[1].set_xlabel(f'Sensitive Feature: {sensitive_feature.title()}', fontsize=11)
-        axes[1].set_ylabel(f'% {target_names[1]}', fontsize=11)
-        axes[1].set_title('Base Rate Disparity (% Positive Outcome)', fontsize=12, fontweight='bold')
-        axes[1].set_xticks(x)
-        axes[1].set_xticklabels(cat_names, rotation=45, ha='right')
-        axes[1].legend()
-        axes[1].set_ylim(0, max(base_rates) * 1.2)
-        
-        # Add percentage labels
-        for i, rate in enumerate(base_rates):
-            axes[1].annotate(f'{rate:.1f}%', (i, rate + 1), ha='center', fontsize=10, fontweight='bold')
-        
-        # For summary
-        grp_names = cat_names
+        grp_names = list(category_target_counts.keys())
         counts = category_target_counts
         sens_name = sensitive_feature
-
     else:
-        # Binary sensitive feature (e.g., sex)
         sens_idx = data['sensitive_col_idx']
         sens_name = data.get('sensitive_col_name', sensitive_feature)
         
-        # Get group labels (customize based on feature)
         if 'sex' in sensitive_feature.lower():
             group_names = {0: 'Female', 1: 'Male'}
         else:
             group_names = {0: f'{sens_name}=0', 1: f'{sens_name}=1'}
         
-        # Count samples per group and target
         group0_mask = (X_train[:, sens_idx] == 0)
         group1_mask = (X_train[:, sens_idx] == 1)
         
@@ -1241,69 +1191,115 @@ def plot_sensitive_distribution(data, dataset_name, sensitive_feature, output_di
                              'negative': int((y_train[group1_mask] == 0).sum()),
                              'total': int(group1_mask.sum())}
         }
-        
-        # Plot 1: Grouped bar chart
         grp_names = list(counts.keys())
-        x = np.arange(len(grp_names))
-        width = 0.35
-        
-        neg_counts = [counts[g]['negative'] for g in grp_names]
-        pos_counts = [counts[g]['positive'] for g in grp_names]
-        
-        bars1 = axes[0].bar(x - width/2, neg_counts, width, label=target_names[0], color='#3498db', alpha=0.8)
-        bars2 = axes[0].bar(x + width/2, pos_counts, width, label=target_names[1], color='#e74c3c', alpha=0.8)
-        
-        axes[0].set_xlabel(f'Sensitive Feature: {sens_name}', fontsize=11)
-        axes[0].set_ylabel('Count', fontsize=11)
-        axes[0].set_title('Distribution by Sensitive Group', fontsize=12, fontweight='bold')
-        axes[0].set_xticks(x)
-        axes[0].set_xticklabels(grp_names)
-        axes[0].legend()
-        
-        # Add count labels
-        for bar in bars1:
-            axes[0].annotate(f'{int(bar.get_height()):,}', 
-                             (bar.get_x() + bar.get_width()/2, bar.get_height()),
-                             ha='center', va='bottom', fontsize=9)
-        for bar in bars2:
-            axes[0].annotate(f'{int(bar.get_height()):,}', 
-                             (bar.get_x() + bar.get_width()/2, bar.get_height()),
-                             ha='center', va='bottom', fontsize=9)
-        
-        # Plot 2: Base rate comparison
-        base_rates = [100 * counts[g]['positive'] / counts[g]['total'] for g in grp_names]
-        
-        colors = ['#9b59b6', '#1abc9c']
-        axes[1].bar(x, base_rates, width=0.5, color=colors, edgecolor='black', linewidth=1)
-        
-        axes[1].axhline(y=100*y_train.mean(), color='black', linestyle='--', linewidth=2, 
-                        label=f'Overall rate: {100*y_train.mean():.1f}%')
-        axes[1].set_xlabel(f'Sensitive Feature: {sens_name}', fontsize=11)
-        axes[1].set_ylabel(f'% {target_names[1]}', fontsize=11)
-        axes[1].set_title('Base Rate Disparity', fontsize=12, fontweight='bold')
-        axes[1].set_xticks(x)
-        axes[1].set_xticklabels(grp_names)
-        axes[1].legend()
-        axes[1].set_ylim(0, max(base_rates) * 1.3)
-        
-        # Add percentage labels
-        for i, rate in enumerate(base_rates):
-            axes[1].annotate(f'{rate:.1f}%', (i, rate + 1.5), ha='center', fontsize=12, fontweight='bold')
+        n_categories = None
     
-    plt.tight_layout()
-    
-    # Save plots in both formats
-    filename = f"distribution_{dataset_name}_{sensitive_feature}.png"
-    saved_paths = {}
-    
+    # Generate plot for each format
     for format in ["notebook", "latex"]:
         settings = FORMAT_SETTINGS[format]
+        show_title = settings["show_title"]
+        
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        
+        if is_multiclass:
+            cat_names = grp_names
+            pos_counts = [counts[c]['positive'] for c in cat_names]
+            neg_counts = [counts[c]['negative'] for c in cat_names]
+            
+            x = np.arange(len(cat_names))
+            width = 0.6
+            
+            axes[0].bar(x, neg_counts, width, label=target_names[0], color='#3498db', alpha=0.8)
+            axes[0].bar(x, pos_counts, width, bottom=neg_counts, label=target_names[1], color='#e74c3c', alpha=0.8)
+            
+            axes[0].set_xlabel(f'Sensitive Feature: {sensitive_feature.title()}', fontsize=11)
+            axes[0].set_ylabel('Count', fontsize=11)
+            if show_title:
+                axes[0].set_title('Distribution by Sensitive Group (Absolute)', fontsize=12, fontweight='bold')
+            axes[0].set_xticks(x)
+            axes[0].set_xticklabels(cat_names, rotation=45, ha='right')
+            axes[0].legend()
+            
+            for i, (neg, pos) in enumerate(zip(neg_counts, pos_counts)):
+                axes[0].annotate(f'{neg+pos:,}', (i, neg+pos+50), ha='center', fontsize=9)
+            
+            base_rates = [100 * counts[c]['positive'] / counts[c]['total'] for c in cat_names]
+            
+            colors = plt.cm.RdYlGn_r(np.linspace(0.2, 0.8, len(cat_names)))
+            axes[1].bar(x, base_rates, width, color=colors, edgecolor='black', linewidth=0.5)
+            
+            axes[1].axhline(y=100*y_train.mean(), color='black', linestyle='--', linewidth=2, 
+                            label=f'Overall rate: {100*y_train.mean():.1f}%')
+            axes[1].set_xlabel(f'Sensitive Feature: {sensitive_feature.title()}', fontsize=11)
+            axes[1].set_ylabel(f'% {target_names[1]}', fontsize=11)
+            if show_title:
+                axes[1].set_title('Base Rate Disparity (% Positive Outcome)', fontsize=12, fontweight='bold')
+            axes[1].set_xticks(x)
+            axes[1].set_xticklabels(cat_names, rotation=45, ha='right')
+            axes[1].legend()
+            axes[1].set_ylim(0, max(base_rates) * 1.2)
+            
+            for i, rate in enumerate(base_rates):
+                axes[1].annotate(f'{rate:.1f}%', (i, rate + 1), ha='center', fontsize=10, fontweight='bold')
+        
+        else:
+            x = np.arange(len(grp_names))
+            width = 0.35
+            
+            neg_counts = [counts[g]['negative'] for g in grp_names]
+            pos_counts = [counts[g]['positive'] for g in grp_names]
+            
+            bars1 = axes[0].bar(x - width/2, neg_counts, width, label=target_names[0], color='#3498db', alpha=0.8)
+            bars2 = axes[0].bar(x + width/2, pos_counts, width, label=target_names[1], color='#e74c3c', alpha=0.8)
+            
+            axes[0].set_xlabel(f'Sensitive Feature: {sens_name}', fontsize=11)
+            axes[0].set_ylabel('Count', fontsize=11)
+            if show_title:
+                axes[0].set_title('Distribution by Sensitive Group', fontsize=12, fontweight='bold')
+            axes[0].set_xticks(x)
+            axes[0].set_xticklabels(grp_names)
+            axes[0].legend()
+            
+            for bar in bars1:
+                axes[0].annotate(f'{int(bar.get_height()):,}', 
+                                 (bar.get_x() + bar.get_width()/2, bar.get_height()),
+                                 ha='center', va='bottom', fontsize=9)
+            for bar in bars2:
+                axes[0].annotate(f'{int(bar.get_height()):,}', 
+                                 (bar.get_x() + bar.get_width()/2, bar.get_height()),
+                                 ha='center', va='bottom', fontsize=9)
+            
+            base_rates = [100 * counts[g]['positive'] / counts[g]['total'] for g in grp_names]
+            
+            colors = ['#9b59b6', '#1abc9c']
+            axes[1].bar(x, base_rates, width=0.5, color=colors, edgecolor='black', linewidth=1)
+            
+            axes[1].axhline(y=100*y_train.mean(), color='black', linestyle='--', linewidth=2, 
+                            label=f'Overall rate: {100*y_train.mean():.1f}%')
+            axes[1].set_xlabel(f'Sensitive Feature: {sens_name}', fontsize=11)
+            axes[1].set_ylabel(f'% {target_names[1]}', fontsize=11)
+            if show_title:
+                axes[1].set_title('Base Rate Disparity', fontsize=12, fontweight='bold')
+            axes[1].set_xticks(x)
+            axes[1].set_xticklabels(grp_names)
+            axes[1].legend()
+            axes[1].set_ylim(0, max(base_rates) * 1.3)
+            
+            for i, rate in enumerate(base_rates):
+                axes[1].annotate(f'{rate:.1f}%', (i, rate + 1.5), ha='center', fontsize=12, fontweight='bold')
+        
+        plt.tight_layout()
+        
+        # Save this format
         output_path = _get_output_path(output_dir, filename, format)
         plt.savefig(output_path, dpi=settings["dpi"], bbox_inches='tight')
         saved_paths[format] = output_path
         print(f"[{format}] Distribution plot saved to: {output_path}")
-    
-    plt.show()
+        
+        if format == "notebook":
+            plt.show()
+        else:
+            plt.close()
     
     # Print summary statistics
     print("\n" + "="*60)
