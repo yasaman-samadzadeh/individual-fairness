@@ -1117,11 +1117,11 @@ def print_fairness_confusion_summary(results: Dict, model_name: str = "Model"):
     print(f"{'='*70}\n")
 
 
+
 # =============================================================================
 # Notebook Display Helpers
 # =============================================================================
-
-def plot_sensitive_distribution(data, dataset_name, sensitive_feature):
+def plot_sensitive_distribution(data, dataset_name, sensitive_feature, output_dir="plots"):
     """
     Plot the distribution of sensitive feature(s) vs target variable with disparity analysis.
     
@@ -1133,7 +1133,15 @@ def plot_sensitive_distribution(data, dataset_name, sensitive_feature):
         Name of the dataset (e.g., 'adult')
     sensitive_feature : str
         Name of the sensitive feature (e.g., 'sex', 'race')
+    output_dir : str
+        Base directory to save plots (default: 'plots')
+        
+    Returns
+    -------
+    dict
+        Paths to saved plots {'notebook': path, 'latex': path}
     """
+    _ensure_output_dirs(output_dir)
     X_train = data['X_train']
     y_train = data['y_train']
     
@@ -1283,6 +1291,18 @@ def plot_sensitive_distribution(data, dataset_name, sensitive_feature):
             axes[1].annotate(f'{rate:.1f}%', (i, rate + 1.5), ha='center', fontsize=12, fontweight='bold')
     
     plt.tight_layout()
+    
+    # Save plots in both formats
+    filename = f"distribution_{dataset_name}_{sensitive_feature}.png"
+    saved_paths = {}
+    
+    for format in ["notebook", "latex"]:
+        settings = FORMAT_SETTINGS[format]
+        output_path = _get_output_path(output_dir, filename, format)
+        plt.savefig(output_path, dpi=settings["dpi"], bbox_inches='tight')
+        saved_paths[format] = output_path
+        print(f"[{format}] Distribution plot saved to: {output_path}")
+    
     plt.show()
     
     # Print summary statistics
@@ -1316,6 +1336,8 @@ def plot_sensitive_distribution(data, dataset_name, sensitive_feature):
     print(f"   • Lowest base rate:  {100*min(rates):.1f}%")
     print(f"   • Disparity ratio:   {disparity_ratio:.2f}x")
     print(f"   • Absolute gap:      {disparity_diff:.1f} percentage points")
+    
+    return saved_paths
 
 
 def plot_and_display_pareto(results, dataset_name, sensitive_feature, output_dir, 
@@ -1474,7 +1496,15 @@ def plot_mds_all_models(results, dataset_name, sensitive_feature, output_dir,
 def plot_case_study_visualizations(cs, dataset_name, sensitive_feature, output_dir):
     """
     Generate case study visualizations: probability sensitivity and counterfactual scatter.
+    
+    Returns
+    -------
+    dict
+        Paths to saved plots {'probability_sensitivity': {...}, 'counterfactual_scatter': {...}}
     """
+    _ensure_output_dirs(output_dir)
+    saved_paths = {}
+    
     rf_proba_change = cs['rf_proba_change']
     mlp_proba_change = cs['mlp_proba_change']
     rf_proba_orig = cs['rf_proba_orig']
@@ -1503,8 +1533,17 @@ def plot_case_study_visualizations(cs, dataset_name, sensitive_feature, output_d
     axes[1].legend()
     
     plt.tight_layout()
-    plt.savefig(f'{output_dir}/notebook/probability_sensitivity_{dataset_name}_{sensitive_feature}.png', dpi=150, bbox_inches='tight')
-    plt.savefig(f'{output_dir}/latex/probability_sensitivity_{dataset_name}_{sensitive_feature}.png', dpi=300, bbox_inches='tight')
+    
+    # Save probability sensitivity plot
+    filename1 = f"probability_sensitivity_{dataset_name}_{sensitive_feature}.png"
+    saved_paths['probability_sensitivity'] = {}
+    for format in ["notebook", "latex"]:
+        settings = FORMAT_SETTINGS[format]
+        output_path = _get_output_path(output_dir, filename1, format)
+        plt.savefig(output_path, dpi=settings["dpi"], bbox_inches='tight')
+        saved_paths['probability_sensitivity'][format] = output_path
+        print(f"[{format}] Probability sensitivity saved to: {output_path}")
+    
     plt.show()
     
     print(f"RF:  Mean |ΔP| = {rf_proba_change.mean():.4f}, Max = {rf_proba_change.max():.4f}")
@@ -1554,12 +1593,23 @@ def plot_case_study_visualizations(cs, dataset_name, sensitive_feature, output_d
     cbar.set_ticklabels(['No', 'Yes'])
     
     plt.tight_layout()
-    plt.savefig(f'{output_dir}/notebook/counterfactual_scatter_{dataset_name}_{sensitive_feature}.png', dpi=150, bbox_inches='tight')
-    plt.savefig(f'{output_dir}/latex/counterfactual_scatter_{dataset_name}_{sensitive_feature}.png', dpi=300, bbox_inches='tight')
+    
+    # Save counterfactual scatter plot
+    filename2 = f"counterfactual_scatter_{dataset_name}_{sensitive_feature}.png"
+    saved_paths['counterfactual_scatter'] = {}
+    for format in ["notebook", "latex"]:
+        settings = FORMAT_SETTINGS[format]
+        output_path = _get_output_path(output_dir, filename2, format)
+        plt.savefig(output_path, dpi=settings["dpi"], bbox_inches='tight')
+        saved_paths['counterfactual_scatter'][format] = output_path
+        print(f"[{format}] Counterfactual scatter saved to: {output_path}")
+    
     plt.show()
     
     print("Blue = consistent (fair), Red = prediction flipped (unfair)")
     print("Points in upper-left/lower-right quadrants crossed the decision boundary")
     if is_multiclass:
         print("(For multiclass: showing probability change to max-change target category)")
+    
+    return saved_paths
 
