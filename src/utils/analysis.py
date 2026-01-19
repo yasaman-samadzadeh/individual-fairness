@@ -118,7 +118,7 @@ def save_smac_results(results: Dict, dataset_name: str, sensitive_feature: str,
     with open(cache_file, 'wb') as f:
         pickle.dump(cache_data, f)
     
-    print(f"✅ Results cached to: {cache_file}")
+    print(f"Results cached to: {cache_file}")
     return cache_file
 
 
@@ -158,7 +158,7 @@ def load_smac_results(dataset_name: str, sensitive_feature: str,
     for model_type, data in cache_data.items():
         results[model_type] = CachedSMAC(data['configs'], data['costs'])
     
-    print(f"✅ Results loaded from cache: {cache_file}")
+    print(f"Results loaded from cache: {cache_file}")
     return results
 
 
@@ -202,10 +202,10 @@ def run_smac_optimization(data, dataset_name, sensitive_feature,
         print(f"Loading results from cache for {dataset_name}/{sensitive_feature}...")
         results = load_smac_results(dataset_name, sensitive_feature, approach=1)
         if results is not None:
-            print(f"✓ Loaded from cache!")
+            print(f" Loaded from cache!")
             return results
         else:
-            print("⚠️  Cache not found! Running optimization...")
+            print("  Cache not found! Running optimization...")
     
     print(f"Running SMAC optimization for {dataset_name}/{sensitive_feature}...")
     results = {}
@@ -225,7 +225,7 @@ def run_smac_optimization(data, dataset_name, sensitive_feature,
         results[model_type] = smac
     
     print("\n" + "="*60)
-    print("✓ Optimization complete!")
+    print(" Optimization complete!")
     print("="*60)
     
     # Save results to cache
@@ -504,7 +504,7 @@ def analyze_trivial_fairness(results, data, model_type='mlp'):
     print(f"  Consistency: {consistency:.1%}")
     
     if accuracy > 0.6:
-        print(f"\n✓ This config has reasonable accuracy ({accuracy:.1%}).")
+        print(f"\n This config has reasonable accuracy ({accuracy:.1%}).")
         print(f"  Not a degenerate 'trivial fairness' case.")
         return {'is_degenerate': False, 'accuracy': accuracy, 'consistency': consistency}
     
@@ -536,9 +536,9 @@ def analyze_trivial_fairness(results, data, model_type='mlp'):
     print(f"\n--- With {fair_config['activation'].upper()} activation ---")
     print(f"Unique predictions: {np.unique(y_pred_original)}", end="")
     if len(np.unique(y_pred_original)) == 1:
-        print(" → Predicts only ONE class!")
+        print("  Predicts only ONE class!")
     else:
-        print(" → Predicts both classes")
+        print("  Predicts both classes")
     print(f"Balanced Accuracy: {acc_original:.1%}")
     print(f"Training iterations: {model_original.n_iter_}")
     
@@ -554,9 +554,9 @@ def analyze_trivial_fairness(results, data, model_type='mlp'):
     print(f"\n--- With ReLU activation (same other params) ---")
     print(f"Unique predictions: {np.unique(y_pred_relu)}", end="")
     if len(np.unique(y_pred_relu)) == 1:
-        print(" → Predicts only ONE class!")
+        print("  Predicts only ONE class!")
     else:
-        print(" → Predicts both classes")
+        print("  Predicts both classes")
     print(f"Balanced Accuracy: {acc_relu:.1%}")
     print(f"Training iterations: {model_relu.n_iter_}")
     
@@ -566,13 +566,13 @@ def analyze_trivial_fairness(results, data, model_type='mlp'):
     print("="*70)
     
     if acc_relu > acc_original + 0.1:
-        print(f"→ {fair_config['activation'].title()} activation caused vanishing gradients")
-        print(f"→ Network never learned → constant predictions → 'trivial' 100% fairness")
-        print(f"→ ReLU fixes this: accuracy improves from {acc_original:.1%} to {acc_relu:.1%}")
-        print(f"\n⚠️  High fairness + low accuracy = likely a degenerate solution!")
+        print(f" {fair_config['activation'].title()} activation caused vanishing gradients")
+        print(f" Network never learned → constant predictions → 'trivial' 100% fairness")
+        print(f" ReLU fixes this: accuracy improves from {acc_original:.1%} to {acc_relu:.1%}")
+        print(f"\nHigh fairness + low accuracy = likely a degenerate solution!")
     else:
-        print(f"→ Activation function doesn't appear to be the issue")
-        print(f"→ May be caused by other hyperparameters (alpha, learning rate)")
+        print(f" Activation function doesn't appear to be the issue")
+        print(f" May be caused by other hyperparameters (alpha, learning rate)")
     
     return {
         'is_degenerate': len(np.unique(y_pred_original)) == 1,
@@ -583,9 +583,7 @@ def analyze_trivial_fairness(results, data, model_type='mlp'):
     }
 
 
-# =============================================================================
 # Pareto Point Selection
-# =============================================================================
 
 def select_balanced_pareto_point(configs, costs, method='knee'):
     """
@@ -655,9 +653,7 @@ def select_balanced_pareto_point(configs, costs, method='knee'):
     }
 
 
-# =============================================================================
 # Case Study Setup
-# =============================================================================
 
 def setup_case_study_analysis(results, data, dataset_name, sensitive_feature,
                               selection_method='best_accuracy'):
@@ -839,14 +835,12 @@ def setup_case_study_analysis(results, data, dataset_name, sensitive_feature,
     print("Counterfactual Consistency on VALIDATION SET:")
     print(f"  RF:  {100*(1-rf_inconsistent.mean()):.1f}% consistent ({rf_inconsistent.sum():,} inconsistent)")
     print(f"  MLP: {100*(1-mlp_inconsistent.mean()):.1f}% consistent ({mlp_inconsistent.sum():,} inconsistent)")
-    print(f"\n✓ These results match what SMAC optimized for!")
     
     return cs
 
 
-# =============================================================================
 # Case Study Functions
-# =============================================================================
+
 
 def case_study_prediction_flip(cs):
     """
@@ -872,7 +866,7 @@ def case_study_prediction_flip(cs):
     print("="*70)
     
     if len(rf_flip_indices) == 0:
-        print("No prediction flips found! Model is perfectly consistent.")
+        print("No prediction flips found!")
         return
     
     flip_proba_changes = rf_proba_change[rf_flip_indices]
@@ -938,7 +932,7 @@ def case_study_consistent_sample(cs):
         print(f"  Original ({sens_names[orig_cat]}):  P(class=1) = {rf_proba_orig[idx]:.4f} → Pred = {rf_pred_orig[idx]}")
         print(f"  Max change flip ({sens_names[target_cat]}): P(class=1) = {cs['rf_probas_flipped'][target_cat][idx]:.4f} → Pred = {cs['rf_preds_flipped'][target_cat][idx]}")
         print(f"  Max |ΔP| = {rf_proba_change[idx]:.4f} (prediction unchanged)")
-        print(f"  ✓ Model robust across ALL {cs['n_categories']} categories")
+        print(f"  Model robust across ALL {cs['n_categories']} categories")
     else:
         sens_name = cs['sensitive_col_name']
         sens_idx = cs['sensitive_col_idx']
@@ -947,7 +941,7 @@ def case_study_consistent_sample(cs):
         print(f"  Original ({sens_name}={orig_val}):  P(class=1) = {rf_proba_orig[idx]:.4f} → Pred = {rf_pred_orig[idx]}")
         print(f"  Flipped ({sens_name}={flip_val}):   P(class=1) = {cs['rf_proba_flip'][idx]:.4f} → Pred = {cs['rf_pred_flip'][idx]}")
         print(f"  |ΔP| = {rf_proba_change[idx]:.4f} (prediction unchanged)")
-        print(f"  ✓ Model relies on other features, not {sens_name}")
+        print(f"  Model relies on other features, not {sens_name}")
 
 
 def case_study_edge_cases(cs):
@@ -986,12 +980,12 @@ def case_study_edge_cases(cs):
         
         if overall_inconsistency_rate > 0:
             vulnerability_ratio = boundary_inconsistency_rate / overall_inconsistency_rate
-            print(f"\n→ Edge cases are {vulnerability_ratio:.1f}x more vulnerable!")
+            print(f"\n Edge cases are {vulnerability_ratio:.1f}x more vulnerable!")
         
         if is_multiclass:
             print(f"\n(Evaluated across all {cs['n_categories']} {cs['sensitive_feature']} categories)")
     
-    print(f"\n✓ Analysis on VALIDATION set ({len(X_val):,} samples)")
+    print(f"\n Analysis on VALIDATION set ({len(X_val):,} samples)")
 
 
 def case_study_model_comparison(cs):
@@ -1019,7 +1013,7 @@ def case_study_model_comparison(cs):
     print(f"Only MLP unfair: {mlp_only.sum():,}")
     print(f"Both unfair:     {both.sum():,}")
     print(f"Both fair:       {neither.sum():,}")
-    print(f"\n→ Models can be unfair to DIFFERENT individuals!")
+    print(f"\nModels can be unfair to DIFFERENT individuals!")
 
 
 def case_study_probability_swings(cs):
@@ -1057,22 +1051,21 @@ def case_study_probability_swings(cs):
         print(f"RF  max swing: Sample {rf_max_idx}")
         print(f"    Direction: {sens_names[rf_orig_cat]} → {sens_names[rf_target_cat]}")
         print(f"    P: {rf_proba_orig[rf_max_idx]:.4f} → {cs['rf_probas_flipped'][rf_target_cat][rf_max_idx]:.4f} (Δ={rf_proba_change[rf_max_idx]:.4f})")
-        print(f"    Prediction flipped: {'Yes ✗' if rf_inconsistent[rf_max_idx] else 'No ✓'}")
+        print(f"    Prediction flipped: {'Yes ' if rf_inconsistent[rf_max_idx] else 'No '}")
         
         print(f"\nMLP max swing: Sample {mlp_max_idx}")
         print(f"    Direction: {sens_names[mlp_orig_cat]} → {sens_names[mlp_target_cat]}")
         print(f"    P: {mlp_proba_orig[mlp_max_idx]:.4f} → {cs['mlp_probas_flipped'][mlp_target_cat][mlp_max_idx]:.4f} (Δ={mlp_proba_change[mlp_max_idx]:.4f})")
-        print(f"    Prediction flipped: {'Yes ✗' if mlp_inconsistent[mlp_max_idx] else 'No ✓'}")
+        print(f"    Prediction flipped: {'Yes ' if mlp_inconsistent[mlp_max_idx] else 'No '}")
     else:
         print(f"RF  max swing: Sample {rf_max_idx}")
         print(f"    P: {rf_proba_orig[rf_max_idx]:.4f} → {cs['rf_proba_flip'][rf_max_idx]:.4f} (Δ={rf_proba_change[rf_max_idx]:.4f})")
-        print(f"    Prediction flipped: {'Yes ✗' if rf_inconsistent[rf_max_idx] else 'No ✓'}")
+        print(f"    Prediction flipped: {'Yes ' if rf_inconsistent[rf_max_idx] else 'No '}")
         
         print(f"\nMLP max swing: Sample {mlp_max_idx}")
         print(f"    P: {mlp_proba_orig[mlp_max_idx]:.4f} → {cs['mlp_proba_flip'][mlp_max_idx]:.4f} (Δ={mlp_proba_change[mlp_max_idx]:.4f})")
-        print(f"    Prediction flipped: {'Yes ✗' if mlp_inconsistent[mlp_max_idx] else 'No ✓'}")
+        print(f"    Prediction flipped: {'Yes ' if mlp_inconsistent[mlp_max_idx] else 'No '}")
     
-    print(f"\n→ Even without flipping, large ΔP indicates sensitivity to protected attribute!")
 
 
 def case_study_directional_analysis(cs):
@@ -1154,5 +1147,5 @@ def case_study_directional_analysis(cs):
         print(f"  {sens_name}=0 → 1: Mean ΔP = {mlp_signed_change[mask_0].mean():+.4f}, |ΔP| = {mlp_proba_change[mask_0].mean():.4f} (n={mask_0.sum():,})")
         print(f"  {sens_name}=1 → 0: Mean ΔP = {mlp_signed_change[mask_1].mean():+.4f}, |ΔP| = {mlp_proba_change[mask_1].mean():.4f} (n={mask_1.sum():,})")
     
-    print(f"\n✓ Analysis on VALIDATION set ({len(X_val):,} samples)")
+    print(f"\n Analysis on VALIDATION set ({len(X_val):,} samples)")
 

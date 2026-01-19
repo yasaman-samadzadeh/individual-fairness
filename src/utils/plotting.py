@@ -27,9 +27,8 @@ from sklearn.preprocessing import MinMaxScaler
 from smac.facade.abstract_facade import AbstractFacade
 
 
-# =============================================================================
+
 # Constants and Type Definitions
-# =============================================================================
 
 PlotFormat = Literal["notebook", "latex"]
 
@@ -73,9 +72,7 @@ MODEL_LABELS = {
 }
 
 
-# =============================================================================
 # Helper Functions
-# =============================================================================
 
 def _get_light_color(hex_color: str, factor: float = 0.3) -> tuple:
     """Create a lighter version of a color by blending with white."""
@@ -244,9 +241,7 @@ def extract_config_data(
     return hp_names, hp_values, costs, pareto_mask
 
 
-# =============================================================================
 # Main Plotting Functions
-# =============================================================================
 
 def plot_pareto_comparison(
     results: Dict[str, AbstractFacade],
@@ -1000,15 +995,15 @@ def plot_fairness_confusion_matrix(
         settings = FORMAT_SETTINGS[format]
         font_scale = settings["font_scale"]
         
-        fig, ax = plt.subplots(figsize=(8 * settings["figsize_scale"], 
-                                         6 * settings["figsize_scale"]))
+        fig, ax = plt.subplots(figsize=(4 * settings["figsize_scale"], 
+                                         3 * settings["figsize_scale"]))
         
         # Create heatmap
         im = ax.imshow(matrix, cmap='Blues', aspect='auto')
         
         # Add colorbar
         cbar = plt.colorbar(im, ax=ax, shrink=0.8)
-        cbar.set_label('Count', fontsize=11 * font_scale)
+        cbar.set_label('Count', fontsize=6 * font_scale)
         
         # Labels
         row_labels = ['Correct\nPrediction', 'Wrong\nPrediction']
@@ -1016,8 +1011,8 @@ def plot_fairness_confusion_matrix(
         
         ax.set_xticks([0, 1])
         ax.set_yticks([0, 1])
-        ax.set_xticklabels(col_labels, fontsize=12 * font_scale)
-        ax.set_yticklabels(row_labels, fontsize=12 * font_scale)
+        ax.set_xticklabels(col_labels, fontsize=6 * font_scale)
+        ax.set_yticklabels(row_labels, fontsize=6 * font_scale)
         
         # Add text annotations
         total = counts['total']
@@ -1033,18 +1028,18 @@ def plot_fairness_confusion_matrix(
                 text_color = 'white' if matrix[i, j] > matrix.max() / 2 else 'black'
                 ax.text(j, i, annotations[i][j],
                        ha='center', va='center',
-                       fontsize=11 * font_scale,
+                       fontsize=6 * font_scale,
                        color=text_color,
                        fontweight='bold')
         
-        ax.set_xlabel('Counterfactual Consistency', fontsize=13 * font_scale)
-        ax.set_ylabel('Prediction Correctness', fontsize=13 * font_scale)
+        ax.set_xlabel('Counterfactual Consistency', fontsize=6 * font_scale)
+        ax.set_ylabel('Prediction Correctness', fontsize=6 * font_scale)
         
         if settings["show_title"]:
             ax.set_title(f'Fairness-Accuracy Confusion Matrix - {model_name}\n'
                         f'Accuracy: {metrics["accuracy"]:.1%} | '
                         f'Consistency: {metrics["consistency"]:.1%}',
-                        fontsize=14 * font_scale, fontweight='bold')
+                        fontsize=6 * font_scale, fontweight='bold')
         
         plt.tight_layout()
         output_path = _get_output_path(output_dir, filename, format)
@@ -1076,7 +1071,7 @@ def print_fairness_confusion_summary(results: Dict, model_name: str = "Model"):
     print(f"FAIRNESS-ACCURACY CONFUSION MATRIX: {model_name}")
     print(f"{'='*70}")
     
-    print(f"\n📊 Matrix (Counts):")
+    print(f"\n Matrix (Counts):")
     print(f"{'':20} {'Consistent':>15} {'Inconsistent':>15} {'Total':>10}")
     print(f"{'-'*60}")
     print(f"{'Correct Prediction':20} {counts['correct_consistent']:>15} "
@@ -1087,17 +1082,17 @@ def print_fairness_confusion_summary(results: Dict, model_name: str = "Model"):
     print(f"{'Total':20} {counts['total_consistent']:>15} "
           f"{counts['total_inconsistent']:>15} {counts['total']:>10}")
     
-    print(f"\n📈 Key Metrics:")
+    print(f"\n Key Metrics:")
     print(f"  • Accuracy:    {metrics['accuracy']:.2%}")
     print(f"  • Consistency: {metrics['consistency']:.2%}")
     
-    print(f"\n🔍 Conditional Probabilities:")
+    print(f"\n Conditional Probabilities:")
     print(f"  • P(Consistent | Correct):   {metrics['p_consistent_given_correct']:.2%}")
     print(f"  • P(Consistent | Wrong):     {metrics['p_consistent_given_wrong']:.2%}")
     print(f"  • P(Correct | Consistent):   {metrics['p_correct_given_consistent']:.2%}")
     print(f"  • P(Correct | Inconsistent): {metrics['p_correct_given_inconsistent']:.2%}")
     
-    print(f"\n💡 Interpretation:")
+    print(f"\n Interpretation:")
     
     # Check if unfairness correlates with errors
     if metrics['p_consistent_given_correct'] > metrics['p_consistent_given_wrong']:
@@ -1118,9 +1113,7 @@ def print_fairness_confusion_summary(results: Dict, model_name: str = "Model"):
 
 
 
-# =============================================================================
 # Notebook Display Helpers
-# =============================================================================
 def plot_sensitive_distribution(data, dataset_name, sensitive_feature, output_dir="plots"):
     """
     Plot the distribution of sensitive feature(s) vs target variable with disparity analysis.
@@ -1327,7 +1320,7 @@ def plot_sensitive_distribution(data, dataset_name, sensitive_feature, output_di
     disparity_ratio = max(rates) / min(rates)
     disparity_diff = 100 * (max(rates) - min(rates))
     
-    print(f"\n📊 Disparity Analysis:")
+    print(f"\n Disparity Analysis:")
     print(f"   • Highest base rate: {100*max(rates):.1f}%")
     print(f"   • Lowest base rate:  {100*min(rates):.1f}%")
     print(f"   • Disparity ratio:   {disparity_ratio:.2f}x")
