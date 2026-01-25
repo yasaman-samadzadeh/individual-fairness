@@ -585,7 +585,8 @@ def analyze_trivial_fairness(results, data, model_type='mlp'):
 
 # Pareto Point Selection
 
-def select_balanced_pareto_point(configs, costs, method='knee'):
+def select_balanced_pareto_point(configs, costs, method='knee', 
+                                  min_accuracy=None, min_consistency=None):
     """
     Select a balanced point from the Pareto front.
     
@@ -599,50 +600,82 @@ def select_balanced_pareto_point(configs, costs, method='knee'):
         'knee' - maximum curvature point (recommended)
         'utopia' - closest to ideal point  
         'weighted' - weighted sum with w=0.5
+    min_accuracy : float, optional
+        Minimum accuracy threshold (0-1). Points below this are excluded from selection.
+    min_consistency : float, optional
+        Minimum consistency threshold (0-1). Points below this are excluded from selection.
         
     Returns
     -------
-    int : index of selected point
+    int : index of selected point (in original configs/costs arrays)
     dict : selection info with accuracy, consistency, and method used
+           Returns None for index if no points meet thresholds.
     """
     # Convert costs to objectives (higher is better)
     accuracy = 1 - costs[:, 0]
     consistency = 1 - costs[:, 1]
     
-    # Handle edge case: only one point
-    if len(configs) == 1:
-        return 0, {
+    # Filter by thresholds if specified
+    valid_mask = np.ones(len(configs), dtype=bool)
+    if min_accuracy is not None:
+        valid_mask &= (accuracy >= min_accuracy)
+    if min_consistency is not None:
+        valid_mask &= (consistency >= min_consistency)
+    
+    valid_indices = np.where(valid_mask)[0]
+    
+    # Handle edge case: no points meet thresholds
+    if len(valid_indices) == 0:
+        return None, {
             'method': method,
-            'accuracy': accuracy[0],
-            'consistency': consistency[0],
+            'accuracy': None,
+            'consistency': None,
+            'message': 'No points meet the threshold criteria',
         }
     
-    # Normalize to [0, 1] for comparison
-    acc_range = accuracy.max() - accuracy.min()
-    con_range = consistency.max() - consistency.min()
+    # Handle edge case: only one valid point
+    if len(valid_indices) == 1:
+        idx = valid_indices[0]
+        return idx, {
+            'method': method,
+            'accuracy': accuracy[idx],
+            'consistency': consistency[idx],
+            'message': 'Single point meeting thresholds',
+        }
     
-    acc_norm = (accuracy - accuracy.min()) / (acc_range + 1e-10)
-    con_norm = (consistency - consistency.min()) / (con_range + 1e-10)
+    # Work with filtered data
+    filtered_accuracy = accuracy[valid_mask]
+    filtered_consistency = consistency[valid_mask]
+    
+    # Normalize to [0, 1] for comparison (using filtered data)
+    acc_range = filtered_accuracy.max() - filtered_accuracy.min()
+    con_range = filtered_consistency.max() - filtered_consistency.min()
+    
+    acc_norm = (filtered_accuracy - filtered_accuracy.min()) / (acc_range + 1e-10)
+    con_norm = (filtered_consistency - filtered_consistency.min()) / (con_range + 1e-10)
     
     if method == 'knee':
         # Find point with maximum perpendicular distance from line connecting extremes
         # This is the "knee" or "elbow" point where trade-off is most balanced
         # Distance = (acc_norm + con_norm - 1) / sqrt(2) for line from (0,1) to (1,0)
         distances = (acc_norm + con_norm - 1) / np.sqrt(2)
-        best_idx = np.argmax(distances)
+        best_filtered_idx = np.argmax(distances)
         
     elif method == 'utopia':
         # Distance to utopia point (1, 1) in normalized space
         distances = np.sqrt((1 - acc_norm)**2 + (1 - con_norm)**2)
-        best_idx = np.argmin(distances)
+        best_filtered_idx = np.argmin(distances)
         
     elif method == 'weighted':
         # Equal weights (0.5 each)
         scores = 0.5 * acc_norm + 0.5 * con_norm
-        best_idx = np.argmax(scores)
+        best_filtered_idx = np.argmax(scores)
     
     else:
         raise ValueError(f"Unknown method: {method}. Use 'knee', 'utopia', or 'weighted'.")
+    
+    # Map back to original index
+    best_idx = valid_indices[best_filtered_idx]
     
     return best_idx, {
         'method': method,
@@ -650,6 +683,7 @@ def select_balanced_pareto_point(configs, costs, method='knee'):
         'consistency': consistency[best_idx],
         'all_accuracies': accuracy,
         'all_consistencies': consistency,
+        'valid_count': len(valid_indices),
     }
 
 

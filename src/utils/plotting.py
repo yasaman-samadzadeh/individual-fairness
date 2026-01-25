@@ -249,6 +249,8 @@ def plot_pareto_comparison(
     filename: str = "pareto_comparison.png",
     formats: List[PlotFormat] = ["notebook", "latex"],
     show_knee_point: bool = True,
+    min_accuracy: float = None,
+    min_consistency: float = None,
 ) -> Dict[str, str]:
     """
     Plot Pareto fronts for multiple models.
@@ -257,6 +259,7 @@ def plot_pareto_comparison(
     - Top row: Individual subplots for each model
     - Bottom row: Combined plot with all models overlaid
     - Optionally marks the knee-optimal (balanced) point on each Pareto front
+    - Optionally filters Pareto front by minimum accuracy/consistency thresholds
     
     Parameters
     ----------
@@ -270,6 +273,12 @@ def plot_pareto_comparison(
         List of formats to generate ("notebook", "latex", or both)
     show_knee_point : bool
         Whether to highlight the knee-optimal point on each Pareto front (default: True)
+    min_accuracy : float, optional
+        Minimum accuracy threshold (0-1). Pareto points below this are marked with red X
+        and excluded from the Pareto line.
+    min_consistency : float, optional
+        Minimum consistency threshold (0-1). Pareto points below this are marked with red X
+        and excluded from the Pareto line.
     
     Returns
     -------
@@ -319,49 +328,91 @@ def plot_pareto_comparison(
                     zorder=1
                 )
             
-            # Plot Pareto front
+            # Plot Pareto front with threshold filtering
             if len(pareto_costs) > 0:
                 pareto_accuracy = 1 - pareto_costs[:, 0]
                 pareto_consistency = 1 - pareto_costs[:, 1]
                 
-                sort_idx = np.argsort(pareto_accuracy)
-                ax.plot(pareto_accuracy[sort_idx], pareto_consistency[sort_idx], 
-                        c=color, linestyle='--', linewidth=2.5, alpha=0.9, zorder=2)
-                ax.scatter(
-                    pareto_accuracy, pareto_consistency,
-                    c=color, marker=marker,
-                    s=130, edgecolors='black', linewidths=2,
-                    label=f'{model_type.upper()} (Pareto Front)' if show_legend else None,
-                    zorder=3
-                )
+                # Identify points that meet/don't meet thresholds
+                meets_threshold = np.ones(len(pareto_accuracy), dtype=bool)
+                if min_accuracy is not None:
+                    meets_threshold &= (pareto_accuracy >= min_accuracy)
+                if min_consistency is not None:
+                    meets_threshold &= (pareto_consistency >= min_consistency)
                 
-                # Mark knee-optimal point
-                if mark_knee and show_knee_point and len(pareto_configs) > 1:
-                    knee_idx, knee_info = select_balanced_pareto_point(pareto_configs, pareto_costs, method='knee')
-                    knee_acc = knee_info['accuracy']
-                    knee_con = knee_info['consistency']
-                    
-                    # Plot knee point with star marker
+                # Plot X on points that don't meet thresholds (same color as model)
+                excluded_mask = ~meets_threshold
+                if excluded_mask.any():
                     ax.scatter(
-                        [knee_acc], [knee_con],
-                        c='gold', marker='*',
-                        s=400, edgecolors='black', linewidths=2,
-                        label=f'{model_type.upper()} Knee-Optimal' if show_legend else None,
-                        zorder=5
+                        pareto_accuracy[excluded_mask], 
+                        pareto_consistency[excluded_mask],
+                        c=color, marker='X',
+                        s=200, edgecolors='black', linewidths=2,
+                        label=f'{model_type.upper()} (below threshold)' if show_legend else None,
+                        zorder=4
+                    )
+                
+                # Plot valid Pareto points
+                valid_mask = meets_threshold
+                if valid_mask.any():
+                    ax.scatter(
+                        pareto_accuracy[valid_mask], pareto_consistency[valid_mask],
+                        c=color, marker=marker,
+                        s=130, edgecolors='black', linewidths=2,
+                        label=f'{model_type.upper()} (Pareto Front)' if show_legend else None,
+                        zorder=3
+                    )
+                
+                # Draw Pareto line only through valid points
+                valid_acc = pareto_accuracy[valid_mask]
+                valid_con = pareto_consistency[valid_mask]
+                if len(valid_acc) > 1:
+                    sort_idx = np.argsort(valid_acc)
+                    ax.plot(valid_acc[sort_idx], valid_con[sort_idx], 
+                            c=color, linestyle='--', linewidth=2.5, alpha=0.9, zorder=2)
+                
+                # Draw threshold lines if specified
+                if min_accuracy is not None:
+                    ax.axvline(x=min_accuracy, color='gray', linestyle=':', 
+                               alpha=0.7, linewidth=1.5, zorder=0)
+                if min_consistency is not None:
+                    ax.axhline(y=min_consistency, color='gray', linestyle=':', 
+                               alpha=0.7, linewidth=1.5, zorder=0)
+                
+                # Mark knee-optimal point (calculated only from points meeting thresholds)
+                if mark_knee and show_knee_point and len(pareto_configs) >= 1:
+                    # Pass thresholds to filter before calculating knee
+                    knee_idx, knee_info = select_balanced_pareto_point(
+                        pareto_configs, pareto_costs, method='knee',
+                        min_accuracy=min_accuracy, min_consistency=min_consistency
                     )
                     
-                    # Add annotation with just the values
-                    ax.annotate(
-                        f'({knee_acc:.2%}, {knee_con:.2%})',
-                        xy=(knee_acc, knee_con),
-                        xytext=(12, 12),
-                        textcoords='offset points',
-                        fontsize=8,
-                        ha='left',
-                        bbox=dict(boxstyle='round,pad=0.2', facecolor='lightyellow', edgecolor='gray', alpha=0.8),
-                        arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0.2', color='gray'),
-                        zorder=6
-                    )
+                    # Only plot if we found a valid knee point
+                    if knee_idx is not None:
+                        knee_acc = knee_info['accuracy']
+                        knee_con = knee_info['consistency']
+                        
+                        # Plot knee point with star marker
+                        ax.scatter(
+                            [knee_acc], [knee_con],
+                            c='gold', marker='*',
+                            s=400, edgecolors='black', linewidths=2,
+                            label=f'{model_type.upper()} Knee-Optimal' if show_legend else None,
+                            zorder=5
+                        )
+                        
+                        # Add annotation with just the values
+                        ax.annotate(
+                            f'({knee_acc:.2%}, {knee_con:.2%})',
+                            xy=(knee_acc, knee_con),
+                            xytext=(12, 12),
+                            textcoords='offset points',
+                            fontsize=8,
+                            ha='left',
+                            bbox=dict(boxstyle='round,pad=0.2', facecolor='lightyellow', edgecolor='gray', alpha=0.8),
+                            arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0.2', color='gray'),
+                            zorder=6
+                        )
             
             font_scale = settings["font_scale"]
             ax.set_xlabel('Balanced Accuracy', fontsize=11 * font_scale)
@@ -1330,7 +1381,8 @@ def plot_sensitive_distribution(data, dataset_name, sensitive_feature, output_di
 
 
 def plot_and_display_pareto(results, dataset_name, sensitive_feature, output_dir, 
-                            get_pareto_front_fn=None, show_knee_point=True):
+                            get_pareto_front_fn=None, show_knee_point=True,
+                            min_accuracy=None, min_consistency=None):
     """
     Generate and display Pareto comparison plot.
     
@@ -1348,6 +1400,12 @@ def plot_and_display_pareto(results, dataset_name, sensitive_feature, output_dir
         Function to get Pareto front (imported if not provided)
     show_knee_point : bool
         Whether to highlight the knee-optimal point on each Pareto front (default: True)
+    min_accuracy : float, optional
+        Minimum accuracy threshold (0-1). Pareto points below this are marked with red X
+        and excluded from the Pareto line.
+    min_consistency : float, optional
+        Minimum consistency threshold (0-1). Pareto points below this are marked with red X
+        and excluded from the Pareto line.
         
     Returns
     -------
@@ -1362,7 +1420,9 @@ def plot_and_display_pareto(results, dataset_name, sensitive_feature, output_dir
         output_dir=output_dir,
         filename=pareto_filename,
         formats=["notebook", "latex"],
-        show_knee_point=show_knee_point
+        show_knee_point=show_knee_point,
+        min_accuracy=min_accuracy,
+        min_consistency=min_consistency,
     )
     
     # Display the notebook version

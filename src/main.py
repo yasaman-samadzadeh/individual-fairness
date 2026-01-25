@@ -1,7 +1,7 @@
 """
 Multi-Objective Fairness Optimization with SMAC
 
-Two approaches for individual fairness evaluation:
+Three approaches for individual fairness evaluation:
 
 Approach 1: Standard models WITH sensitive features included.
 - Train RF/MLP with all features (including sex, race)
@@ -11,6 +11,12 @@ Approach 2: Standard models + SenSeI WITHOUT sensitive features.
 - Train RF/MLP/SenSeI without sensitive features
 - Use sensitive features only for SenSeI's fair distance metric
 - Evaluate counterfactual consistency on proxy features (e.g., relationship_Wife)
+
+Approach 3: Standard models + SenSeI WITH sensitive features included.
+- Train RF/MLP/SenSeI with all features (including sensitive features)
+- SenSeI uses sensitive features for distance metric learning AND in training
+- Evaluate counterfactual consistency by flipping sensitive features directly
+- Useful when no proxy features are available (e.g., German Credit)
 
 Models: RandomForest, MLP, SenSeI (PyTorch neural network)
 Objectives: Accuracy (maximize) + Counterfactual Consistency (maximize)
@@ -45,7 +51,9 @@ from datasets import (
     create_flipped_data,
     create_flipped_data_multiclass_exhaustive,
     create_flipped_data_sex_proxy,
+    create_flipped_data_multi_sensitive_exhaustive,
     counterfactual_consistency_multiclass_exhaustive,
+    counterfactual_consistency_multi_sensitive_exhaustive,
     list_available_datasets, 
     get_dataset_config
 )
@@ -605,6 +613,434 @@ class SenSeIPipeline:
 
 
 # =============================================================================
+# Approach 3: SenSeI WITH Sensitive Features (Option A)
+# =============================================================================
+
+class SenSeIPipelineApproach3:
+    """
+    Pipeline for SenSeI with sensitive features INCLUDED in training (Approach 3 / Option A).
+    
+    Key differences from SenSeIPipeline (Approach 2):
+    - Training data INCLUDES sensitive features (they're part of X_train)
+    - Sensitive features are extracted from X_train for distance metric learning
+    - Evaluation by flipping sensitive features directly (not proxy)
+    
+    This approach is useful when:
+    - No proxy features are available (e.g., German Credit)
+    - You want SenSeI to learn invariance while still seeing the sensitive attributes
+    """
+    
+    def __init__(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
+        sensitive_col_idx: Optional[int] = None,
+        sensitive_col_indices: Optional[List[int]] = None,
+        is_multiclass: bool = False,
+    ):
+        """
+        Parameters
+        ----------
+        X_train : np.ndarray
+            Training feature matrix (WITH sensitive features included)
+        y_train : np.ndarray
+            Training target labels
+        X_val : np.ndarray
+            Validation feature matrix (WITH sensitive features)
+        y_val : np.ndarray
+            Validation target labels
+        sensitive_col_idx : int, optional
+            Index of sensitive column for binary counterfactual
+        sensitive_col_indices : list of int, optional
+            Indices of sensitive columns for multiclass counterfactual
+        is_multiclass : bool
+            If True, use exhaustive multiclass counterfactual
+        """
+        if not SENSEI_AVAILABLE:
+            raise ImportError(
+                "inFairness not installed. Install with: pip install inFairness"
+            )
+        
+        self.X_train = X_train
+        self.y_train = y_train
+        self.X_val = X_val
+        self.y_val = y_val
+        self.is_multiclass = is_multiclass
+        
+        if is_multiclass:
+            if sensitive_col_indices is None:
+                raise ValueError("sensitive_col_indices required for multiclass")
+            self.sensitive_col_indices = sensitive_col_indices
+            # Extract protected features from training data for distance metric
+            self.X_protected_train = X_train[:, sensitive_col_indices].astype(np.float32)
+        else:
+            if sensitive_col_idx is None:
+                raise ValueError("sensitive_col_idx required for binary")
+            self.sensitive_col_idx = sensitive_col_idx
+            # Extract protected feature from training data for distance metric
+            self.X_protected_train = X_train[:, [sensitive_col_idx]].astype(np.float32)
+        
+        # Device selection: CUDA (NVIDIA) > MPS (Mac) > CPU
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+            print("Using MPS (Mac GPU) acceleration")
+        else:
+            self.device = torch.device("cpu")
+            print("Warning: No GPU available, using CPU (will be slow)")
+
+    @property
+    def configspace(self) -> ConfigurationSpace:
+        return get_sensei_configspace()
+    
+    def train(self, config: Configuration, seed: int = 0) -> Dict[str, float]:
+        """
+        Train SenSeI model WITH sensitive features and evaluate by flipping them directly.
+        
+        Key difference from Approach 2:
+        - Model input includes sensitive features
+        - Distance metric still learns to ignore sensitive attribute variations
+        - Counterfactual evaluation flips sensitive features directly (not proxy)
+        """
+        # Convert to torch tensors
+        X_train_t = torch.FloatTensor(self.X_train).to(self.device)
+        y_train_t = torch.LongTensor(self.y_train).to(self.device)
+        X_val_t = torch.FloatTensor(self.X_val).to(self.device)
+        X_prot_train_t = torch.FloatTensor(self.X_protected_train).to(self.device)
+        
+        # Build network architecture
+        n_features = self.X_train.shape[1]  # Includes sensitive features
+        hidden_sizes = [config["n_neurons"]] * config["n_hidden_layers"]
+        output_size = 2  # Binary classification
+        
+        layers = []
+        prev_size = n_features
+        for h_size in hidden_sizes:
+            layers.extend([
+                torch.nn.Linear(prev_size, h_size),
+                torch.nn.ReLU(),
+            ])
+            prev_size = h_size
+        layers.append(torch.nn.Linear(prev_size, output_size))
+        
+        network = torch.nn.Sequential(*layers).to(self.device)
+        
+        # ============================================================
+        # Distance metrics (same as Approach 2)
+        # ============================================================
+        
+        # Input space distance: learns to ignore variations in sensitive attributes
+        distance_x = LogisticRegSensitiveSubspace()
+        distance_x.fit(X_train_t, data_SensitiveAttrs=X_prot_train_t)
+        distance_x.to(self.device)
+        
+        # Output space distance: SquaredEuclideanDistance
+        distance_y = SquaredEuclideanDistance()
+        distance_y.fit(num_dims=output_size)
+        distance_y.to(self.device)
+        
+        # ============================================================
+        # Create SenSeI model
+        # ============================================================
+        sensei = SenSeI(
+            network=network,
+            distance_x=distance_x,
+            distance_y=distance_y,
+            loss_fn=F.cross_entropy,
+            rho=config["rho"],
+            eps=config["eps"],
+            auditor_nsteps=config["auditor_nsteps"],
+            auditor_lr=config["auditor_lr"],
+        )
+        
+        # ============================================================
+        # Training loop
+        # ============================================================
+        optimizer = torch.optim.Adam(network.parameters(), lr=config["learning_rate"])
+        batch_size = config["batch_size"]
+        n_epochs = config["epochs"]
+        
+        sensei.train()
+        
+        for epoch in range(n_epochs):
+            perm = torch.randperm(len(X_train_t))
+            
+            for i in range(0, len(X_train_t), batch_size):
+                idx = perm[i:i+batch_size]
+                X_batch = X_train_t[idx]
+                y_batch = y_train_t[idx]
+                
+                optimizer.zero_grad()
+                result = sensei(X_batch, y_batch)
+                result.loss.backward()
+                optimizer.step()
+        
+        # ============================================================
+        # Evaluation by flipping sensitive features directly
+        # ============================================================
+        network.eval()
+        with torch.no_grad():
+            logits = network(X_val_t)
+            y_pred = logits.argmax(dim=1).cpu().numpy()
+            
+            if self.is_multiclass:
+                # Multiclass: exhaustive flip to all categories
+                flipped_versions, orig_cats = create_flipped_data_multiclass_exhaustive(
+                    self.X_val, self.sensitive_col_indices
+                )
+                y_preds_flipped = []
+                for X_flip in flipped_versions:
+                    X_flip_t = torch.FloatTensor(X_flip).to(self.device)
+                    logits_flip = network(X_flip_t)
+                    y_preds_flipped.append(logits_flip.argmax(dim=1).cpu().numpy())
+                
+                consistency = counterfactual_consistency_multiclass_exhaustive(
+                    y_pred, y_preds_flipped, orig_cats
+                )
+            else:
+                # Binary: simple flip
+                X_val_flipped = create_flipped_data(self.X_val, self.sensitive_col_idx)
+                X_val_flipped_t = torch.FloatTensor(X_val_flipped).to(self.device)
+                logits_flipped = network(X_val_flipped_t)
+                y_pred_flipped = logits_flipped.argmax(dim=1).cpu().numpy()
+                
+                consistency = counterfactual_consistency(y_pred, y_pred_flipped)
+        
+        accuracy = balanced_accuracy_score(self.y_val, y_pred)
+        
+        return {
+            "error": 1.0 - accuracy,
+            "inconsistency": 1.0 - consistency,
+        }
+
+
+# =============================================================================
+# Approach 3 Multi-Sensitive: Evaluate on ALL combinations of sensitive features
+# =============================================================================
+
+class FairnessPipelineMultiSensitive:
+    """
+    Pipeline for RF/MLP with multi-sensitive exhaustive counterfactual evaluation.
+    
+    Evaluates by checking ALL combinations of multiple sensitive features.
+    E.g., for (sex, race), checks all (sex_value, race_value) combinations.
+    """
+    
+    def __init__(
+        self,
+        model_type: str,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
+        sensitive_features_info: List[Dict],
+    ):
+        """
+        Parameters
+        ----------
+        model_type : str
+            "rf" for Random Forest, "mlp" for MLP
+        X_train, y_train : np.ndarray
+            Training data
+        X_val, y_val : np.ndarray
+            Validation data
+        sensitive_features_info : list of dict
+            List of sensitive feature specifications:
+            [{'name': 'sex', 'col_indices': [10]}, 
+             {'name': 'race', 'col_indices': [11, 12, 13, 14, 15]}]
+        """
+        self.model_type = model_type
+        self.X_train = X_train
+        self.y_train = y_train
+        self.X_val = X_val
+        self.y_val = y_val
+        self.sensitive_features_info = sensitive_features_info
+
+    @property
+    def configspace(self) -> ConfigurationSpace:
+        if self.model_type == "rf":
+            return get_rf_configspace()
+        elif self.model_type == "mlp":
+            return get_mlp_configspace()
+        else:
+            raise ValueError(f"Unknown model type: {self.model_type}")
+    
+    def _create_model(self, config: Configuration):
+        if self.model_type == "rf":
+            return create_rf_model(config)
+        elif self.model_type == "mlp":
+            return create_mlp_model(config)
+    
+    def train(self, config: Configuration, seed: int = 0) -> Dict[str, float]:
+        """Train and evaluate with multi-sensitive exhaustive counterfactual."""
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore")
+            
+            model = self._create_model(config)
+            model.fit(self.X_train, self.y_train)
+            
+            y_pred = model.predict(self.X_val)
+            accuracy = balanced_accuracy_score(self.y_val, y_pred)
+            
+            # Multi-sensitive exhaustive counterfactual
+            flipped_versions, combo_labels, orig_combos = create_flipped_data_multi_sensitive_exhaustive(
+                self.X_val, self.sensitive_features_info
+            )
+            y_preds_flipped = [model.predict(X_flip) for X_flip in flipped_versions]
+            consistency = counterfactual_consistency_multi_sensitive_exhaustive(
+                y_pred, y_preds_flipped, orig_combos
+            )
+        
+        return {
+            "error": 1.0 - accuracy,
+            "inconsistency": 1.0 - consistency,
+        }
+
+
+class SenSeIPipelineMultiSensitive:
+    """
+    SenSeI pipeline with multi-sensitive exhaustive counterfactual evaluation.
+    
+    - Trains WITH sensitive features
+    - Uses ALL sensitive features for distance metric learning
+    - Evaluates by checking ALL combinations of sensitive features
+    """
+    
+    def __init__(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
+        sensitive_features_info: List[Dict],
+    ):
+        """
+        Parameters
+        ----------
+        sensitive_features_info : list of dict
+            List of sensitive feature specifications:
+            [{'name': 'sex', 'col_indices': [10]}, 
+             {'name': 'race', 'col_indices': [11, 12, 13, 14, 15]}]
+        """
+        if not SENSEI_AVAILABLE:
+            raise ImportError("inFairness not installed. Install with: pip install inFairness")
+        
+        self.X_train = X_train
+        self.y_train = y_train
+        self.X_val = X_val
+        self.y_val = y_val
+        self.sensitive_features_info = sensitive_features_info
+        
+        # Extract ALL sensitive columns for distance metric
+        all_sensitive_indices = []
+        for feat_info in sensitive_features_info:
+            all_sensitive_indices.extend(feat_info['col_indices'])
+        self.X_protected_train = X_train[:, all_sensitive_indices].astype(np.float32)
+        
+        # Device selection
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+            print("Using MPS (Mac GPU) acceleration")
+        else:
+            self.device = torch.device("cpu")
+            print("Warning: No GPU available, using CPU (will be slow)")
+
+    @property
+    def configspace(self) -> ConfigurationSpace:
+        return get_sensei_configspace()
+    
+    def train(self, config: Configuration, seed: int = 0) -> Dict[str, float]:
+        """Train SenSeI and evaluate with multi-sensitive exhaustive counterfactual."""
+        X_train_t = torch.FloatTensor(self.X_train).to(self.device)
+        y_train_t = torch.LongTensor(self.y_train).to(self.device)
+        X_val_t = torch.FloatTensor(self.X_val).to(self.device)
+        X_prot_train_t = torch.FloatTensor(self.X_protected_train).to(self.device)
+        
+        # Build network
+        n_features = self.X_train.shape[1]
+        hidden_sizes = [config["n_neurons"]] * config["n_hidden_layers"]
+        output_size = 2
+        
+        layers = []
+        prev_size = n_features
+        for h_size in hidden_sizes:
+            layers.extend([torch.nn.Linear(prev_size, h_size), torch.nn.ReLU()])
+            prev_size = h_size
+        layers.append(torch.nn.Linear(prev_size, output_size))
+        
+        network = torch.nn.Sequential(*layers).to(self.device)
+        
+        # Distance metrics
+        distance_x = LogisticRegSensitiveSubspace()
+        distance_x.fit(X_train_t, data_SensitiveAttrs=X_prot_train_t)
+        distance_x.to(self.device)
+        
+        distance_y = SquaredEuclideanDistance()
+        distance_y.fit(num_dims=output_size)
+        distance_y.to(self.device)
+        
+        # Create SenSeI
+        sensei = SenSeI(
+            network=network,
+            distance_x=distance_x,
+            distance_y=distance_y,
+            loss_fn=F.cross_entropy,
+            rho=config["rho"],
+            eps=config["eps"],
+            auditor_nsteps=config["auditor_nsteps"],
+            auditor_lr=config["auditor_lr"],
+        )
+        
+        # Training loop
+        optimizer = torch.optim.Adam(network.parameters(), lr=config["learning_rate"])
+        batch_size = config["batch_size"]
+        n_epochs = config["epochs"]
+        
+        sensei.train()
+        for epoch in range(n_epochs):
+            perm = torch.randperm(len(X_train_t))
+            for i in range(0, len(X_train_t), batch_size):
+                idx = perm[i:i+batch_size]
+                optimizer.zero_grad()
+                result = sensei(X_train_t[idx], y_train_t[idx])
+                result.loss.backward()
+                optimizer.step()
+        
+        # Evaluation with multi-sensitive exhaustive counterfactual
+        network.eval()
+        with torch.no_grad():
+            logits = network(X_val_t)
+            y_pred = logits.argmax(dim=1).cpu().numpy()
+            
+            # Get all combinations
+            flipped_versions, combo_labels, orig_combos = create_flipped_data_multi_sensitive_exhaustive(
+                self.X_val, self.sensitive_features_info
+            )
+            
+            y_preds_flipped = []
+            for X_flip in flipped_versions:
+                X_flip_t = torch.FloatTensor(X_flip).to(self.device)
+                logits_flip = network(X_flip_t)
+                y_preds_flipped.append(logits_flip.argmax(dim=1).cpu().numpy())
+            
+            consistency = counterfactual_consistency_multi_sensitive_exhaustive(
+                y_pred, y_preds_flipped, orig_combos
+            )
+        
+        accuracy = balanced_accuracy_score(self.y_val, y_pred)
+        
+        return {
+            "error": 1.0 - accuracy,
+            "inconsistency": 1.0 - consistency,
+        }
+
+
+# =============================================================================
 # SMAC Optimization
 # =============================================================================
 
@@ -636,7 +1072,11 @@ def run_optimization(
     output_dir : str
         Directory to save SMAC output
     approach : int
-        1 = with sensitive features, 2 = without sensitive features
+        1 = with sensitive features (RF/MLP only)
+        2 = without sensitive features, evaluate on proxy (RF/MLP/SenSeI)
+        3 = with sensitive features, evaluate directly (RF/MLP/SenSeI)
+        4 = with sensitive features, evaluate on ALL combinations (RF/MLP/SenSeI)
+            Requires 'sensitive_features_info' in data dict
 
     Returns
     -------
@@ -684,8 +1124,9 @@ def run_optimization(
                 sensitive_col_idx=data['sensitive_col_idx'],
                 is_multiclass=False,
             )
-    else:
-        # Approach 2: Without sensitive features
+    
+    elif approach == 2:
+        # Approach 2: Without sensitive features, evaluate on proxy
         # Get relationship column indices for sex proxy flip
         husband_idx = data['husband_col_idx']
         wife_idx = data['wife_col_idx']
@@ -727,6 +1168,107 @@ def run_optimization(
                 wife_col_idx=wife_idx,
                 unmarried_col_idx=unmarried_idx,
             )
+    
+    elif approach == 3:
+        # Approach 3: With sensitive features, evaluate directly (Option A)
+        # Same as Approach 1 for RF/MLP, but SenSeI also learns distance metric
+        is_multiclass = data.get('is_multiclass', False)
+        
+        if model_type == "sensei":
+            if not SENSEI_AVAILABLE:
+                raise ImportError("SenSeI requires inFairness. Install with: pip install inFairness")
+            
+            if is_multiclass:
+                print(f"SenSeI Approach 3: MULTICLASS counterfactual (exhaustive, {len(data['sensitive_col_indices'])} categories)")
+                pipeline = SenSeIPipelineApproach3(
+                    X_train=data['X_train'],
+                    y_train=data['y_train'],
+                    X_val=data['X_val'],
+                    y_val=data['y_val'],
+                    sensitive_col_indices=data['sensitive_col_indices'],
+                    is_multiclass=True,
+                )
+            else:
+                print(f"SenSeI Approach 3: BINARY counterfactual (single column flip)")
+                pipeline = SenSeIPipelineApproach3(
+                    X_train=data['X_train'],
+                    y_train=data['y_train'],
+                    X_val=data['X_val'],
+                    y_val=data['y_val'],
+                    sensitive_col_idx=data['sensitive_col_idx'],
+                    is_multiclass=False,
+                )
+        else:
+            # RF/MLP in Approach 3 is same as Approach 1 (use FairnessPipeline)
+            if is_multiclass:
+                print(f"Using MULTICLASS counterfactual (exhaustive, {len(data['sensitive_col_indices'])} categories)")
+                pipeline = FairnessPipeline(
+                    model_type=model_type,
+                    X_train=data['X_train'],
+                    y_train=data['y_train'],
+                    X_val=data['X_val'],
+                    y_val=data['y_val'],
+                    sensitive_col_indices=data['sensitive_col_indices'],
+                    is_multiclass=True,
+                )
+            else:
+                print(f"Using BINARY counterfactual (single column flip)")
+                pipeline = FairnessPipeline(
+                    model_type=model_type,
+                    X_train=data['X_train'],
+                    y_train=data['y_train'],
+                    X_val=data['X_val'],
+                    y_val=data['y_val'],
+                    sensitive_col_idx=data['sensitive_col_idx'],
+                    is_multiclass=False,
+                )
+    
+    elif approach == 4:
+        # Approach 4: Multi-sensitive exhaustive evaluation (all combinations)
+        if 'sensitive_features_info' not in data:
+            raise ValueError(
+                "Approach 4 requires 'sensitive_features_info' in data dict. "
+                "This should be a list of dicts with 'name' and 'col_indices' keys."
+            )
+        
+        sensitive_features_info = data['sensitive_features_info']
+        n_features = len(sensitive_features_info)
+        feature_names = [f['name'] for f in sensitive_features_info]
+        
+        # Calculate total combinations
+        import itertools
+        n_cats = [len(f['col_indices']) if len(f['col_indices']) > 1 else 2 for f in sensitive_features_info]
+        n_combinations = 1
+        for n in n_cats:
+            n_combinations *= n
+        
+        print(f"Using MULTI-SENSITIVE exhaustive counterfactual")
+        print(f"  Sensitive features: {feature_names}")
+        print(f"  Total combinations: {n_combinations}")
+        
+        if model_type == "sensei":
+            if not SENSEI_AVAILABLE:
+                raise ImportError("SenSeI requires inFairness. Install with: pip install inFairness")
+            
+            pipeline = SenSeIPipelineMultiSensitive(
+                X_train=data['X_train'],
+                y_train=data['y_train'],
+                X_val=data['X_val'],
+                y_val=data['y_val'],
+                sensitive_features_info=sensitive_features_info,
+            )
+        else:
+            pipeline = FairnessPipelineMultiSensitive(
+                model_type=model_type,
+                X_train=data['X_train'],
+                y_train=data['y_train'],
+                X_val=data['X_val'],
+                y_val=data['y_val'],
+                sensitive_features_info=sensitive_features_info,
+            )
+    
+    else:
+        raise ValueError(f"Unknown approach: {approach}. Must be 1, 2, 3, or 4.")
     
     # Define scenario
     objectives = ["error", "inconsistency"]
@@ -906,6 +1448,97 @@ def main_approach2(
         results, 
         dataset_name, 
         f"proxy_{proxy_feature}_approach2"
+    )
+    print_pareto_summary(results)
+    
+    return results, data
+
+
+def main_approach3(
+    dataset_name: str = "adult",
+    sensitive_feature: str = "sex",
+    walltime_limit: int = 300,
+    n_trials: int = 100,
+    include_sensei: bool = True,
+):
+    """
+    Run Approach 3: Models WITH sensitive features + SenSeI with direct evaluation.
+    
+    This is "Option A" from our discussion:
+    - Train RF/MLP/SenSeI WITH sensitive features included
+    - SenSeI learns distance metric to ignore sensitive attribute variations
+    - Evaluate counterfactual consistency by flipping sensitive features directly
+    
+    Use this approach when:
+    - No proxy features are available (e.g., German Credit)
+    - You want to measure fairness directly on sensitive attributes
+    
+    Parameters
+    ----------
+    dataset_name : str
+        Name of dataset to use (e.g., "adult", "german_credit")
+    sensitive_feature : str
+        Which sensitive feature to use for counterfactual evaluation
+    walltime_limit : int
+        Time limit per model in seconds
+    n_trials : int
+        Max configurations per model
+    include_sensei : bool
+        Whether to include SenSeI model (requires inFairness)
+    """
+    config = get_dataset_config(dataset_name)
+    
+    print("="*60)
+    print("APPROACH 3: Models WITH Sensitive Features (SenSeI + Direct Evaluation)")
+    print("="*60)
+    print(f"Dataset: {config.name} (OpenML ID: {config.openml_id})")
+    print(f"Sensitive feature: {sensitive_feature}")
+    print(f"Time limit per model: {walltime_limit}s")
+    print(f"Max trials per model: {n_trials}")
+    print(f"Include SenSeI: {include_sensei}")
+    
+    if include_sensei and not SENSEI_AVAILABLE:
+        print("\nWarning: SenSeI not available (inFairness not installed)")
+        include_sensei = False
+    
+    # Load data for Approach 3 (same as Approach 1 - keeps sensitive features)
+    print(f"\nLoading {config.name} dataset (Approach 3)...")
+    data = load_dataset(
+        dataset_name,
+        sensitive_feature=sensitive_feature,
+        approach=3,
+    )
+    
+    # Run optimization for each model
+    results = {}
+    
+    # Standard models with sensitive features (same as Approach 1)
+    for model_type in ["rf", "mlp"]:
+        smac = run_optimization(
+            model_type=model_type,
+            data=data,
+            walltime_limit=walltime_limit,
+            n_trials=n_trials,
+            approach=3,
+        )
+        results[model_type] = smac
+    
+    # SenSeI with sensitive features (different from Approach 2)
+    if include_sensei:
+        smac = run_optimization(
+            model_type="sensei",
+            data=data,
+            walltime_limit=walltime_limit,
+            n_trials=n_trials,
+            approach=3,
+        )
+        results["sensei"] = smac
+    
+    # Plot and summarize results
+    generate_all_visualizations(
+        results, 
+        dataset_name, 
+        f"{sensitive_feature}_approach3"
     )
     print_pareto_summary(results)
     

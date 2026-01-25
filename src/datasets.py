@@ -88,13 +88,26 @@ DATASET_CONFIGS: Dict[str, DatasetConfig] = {
         name="German Credit",
         openml_id=31,
         sensitive_features={
-            # personal_status combines gender + marital status
-            # We'll handle this specially in preprocessing
-            "personal_status": "personal_status_male",  # Will be created during preprocessing
+            # personal_status combines gender + marital status (4 categories)
+            # Treated as multiclass like race_all in Adult dataset
+            "personal_status": None,  # Multiclass: keeps ALL one-hot columns
         },
-        columns_to_drop=[],
+        # Multiclass sensitive features: exhaustive counterfactual (flip to all other categories)
+        multiclass_sensitive_features={
+            "personal_status": [
+                "personal_status_male div/sep",      # 50 (5.00%)
+                "personal_status_female div/dep/mar", # 310 (31.00%)
+                "personal_status_male single",        # 548 (54.80%)
+                "personal_status_male mar/wid",       # 92 (9.20%)
+            ],
+        },
+        # No proxy features available
+        proxy_features={},
+        columns_to_drop=[
+            "foreign_worker",  # 96.3% are "yes" - extremely imbalanced, provides little signal
+        ],
         drop_prefixes_after_encoding=[],
-        target_positive_class="good",  # 'good' vs 'bad' credit
+        target_positive_class="good",  # 'good' vs 'bad' credit (good=700, bad=300)
     ),
     
     "compas": DatasetConfig(
@@ -192,14 +205,15 @@ def load_dataset(
     config = get_dataset_config(dataset_name)
     
     # Validate inputs based on approach
-    if approach == 1:
+    if approach in (1, 3):
+        # Approach 1 and 3 both keep sensitive features
         if sensitive_feature not in config.sensitive_features:
             available = list(config.sensitive_features.keys())
             raise ValueError(
                 f"Invalid sensitive feature '{sensitive_feature}' for {dataset_name}. "
                 f"Available: {available}"
             )
-    else:  # Approach 2
+    elif approach == 2:
         # Default to removing all sensitive features
         if sensitive_features_to_remove is None:
             sensitive_features_to_remove = list(config.sensitive_features.keys())
@@ -225,6 +239,9 @@ def load_dataset(
     print(f"Loading {config.name} from OpenML (ID: {config.openml_id})...")
     if approach == 1:
         print(f"APPROACH 1: Keeping sensitive features in training")
+        print(f"  Sensitive feature for counterfactual: {sensitive_feature}")
+    elif approach == 3:
+        print(f"APPROACH 3: Keeping sensitive features in training (with SenSeI distance learning)")
         print(f"  Sensitive feature for counterfactual: {sensitive_feature}")
     else:
         print(f"APPROACH 2: Removing sensitive features from training")
@@ -265,13 +282,17 @@ def load_dataset(
             X_df, categorical_cols, numerical_cols
         )
     
-    # Dataset-specific preprocessing
+    # Dataset-specific preprocessing for German Credit
+    # Only convert to binary if NOT using multiclass approach
     if dataset_name == "german_credit" and (
         sensitive_feature == "personal_status" or 
         (approach == 2 and "personal_status" in (sensitive_features_to_remove or []))
     ):
-        X_df = _preprocess_german_credit_gender(X_df)
-        categorical_cols = [c for c in categorical_cols if c != "personal_status"]
+        # Check if this is a multiclass sensitive feature - if so, skip binary conversion
+        is_multiclass_personal_status = sensitive_feature in config.multiclass_sensitive_features
+        if not is_multiclass_personal_status:
+            X_df = _preprocess_german_credit_gender(X_df)
+            categorical_cols = [c for c in categorical_cols if c != "personal_status"]
     
     # One-hot encode categorical features
     X_encoded = pd.get_dummies(X_df, columns=categorical_cols, drop_first=False)
@@ -286,8 +307,8 @@ def load_dataset(
     # Approach-specific processing
     # =========================================================================
     
-    if approach == 1:
-        # APPROACH 1: Keep sensitive feature, drop other related columns
+    if approach in (1, 3):
+        # APPROACH 1 & 3: Keep sensitive feature, drop other related columns
         
         # Check if this is a multiclass sensitive feature
         is_multiclass = sensitive_feature in config.multiclass_sensitive_features
@@ -417,7 +438,7 @@ def load_dataset(
         'approach': approach,
     }
     
-    if approach == 1:
+    if approach in (1, 3):
         if is_multiclass:
             result.update({
                 'is_multiclass': True,
@@ -638,6 +659,151 @@ def counterfactual_consistency_multiclass_exhaustive(
                 continue  # Skip - not a real flip
             
             flipped_pred = y_preds_flipped[target_cat][sample_idx]
+            if orig_pred == flipped_pred:
+                total_consistent += 1
+            total_comparisons += 1
+    
+    return total_consistent / total_comparisons if total_comparisons > 0 else 1.0
+
+
+def create_flipped_data_multi_sensitive_exhaustive(
+    X: np.ndarray,
+    sensitive_features_info: List[Dict],
+) -> tuple:
+    """
+    Create exhaustive counterfactual data for MULTIPLE sensitive features simultaneously.
+    
+    For each sample, creates ALL combinations of sensitive feature values except the original.
+    E.g., for (sex=Male, race=White), creates:
+    - (Male, Black), (Male, Asian), ...
+    - (Female, White), (Female, Black), (Female, Asian), ...
+    
+    Parameters
+    ----------
+    X : np.ndarray
+        Feature matrix
+    sensitive_features_info : list of dict
+        List of sensitive feature specifications, each containing:
+        - 'col_indices': list of int - indices of one-hot columns for this feature
+        - 'name': str - name of the feature (for debugging)
+        
+        Example: [
+            {'name': 'sex', 'col_indices': [10]},  # Binary: single column
+            {'name': 'race', 'col_indices': [11, 12, 13, 14, 15]},  # Multiclass: 5 columns
+        ]
+        
+    Returns
+    -------
+    flipped_versions : list of np.ndarray
+        List of arrays, one for each combination (excluding original for each sample).
+        Each array has shape (n_samples, n_features).
+    combination_labels : list of tuple
+        List of (feature1_cat, feature2_cat, ...) tuples describing each flipped version.
+    original_combinations : np.ndarray
+        Array of shape (n_samples,) with index of original combination for each sample.
+    """
+    import itertools
+    
+    n_samples = X.shape[0]
+    
+    # Get number of categories for each feature
+    n_categories_per_feature = []
+    for feat_info in sensitive_features_info:
+        col_indices = feat_info['col_indices']
+        if len(col_indices) == 1:
+            # Binary feature (single column, 0 or 1)
+            n_categories_per_feature.append(2)
+        else:
+            # Multiclass feature (one-hot encoded)
+            n_categories_per_feature.append(len(col_indices))
+    
+    # Generate all combinations
+    all_combinations = list(itertools.product(*[range(n) for n in n_categories_per_feature]))
+    n_combinations = len(all_combinations)
+    
+    # Find original combination for each sample
+    original_combinations = np.zeros(n_samples, dtype=int)
+    for sample_idx in range(n_samples):
+        orig_cats = []
+        for feat_info in sensitive_features_info:
+            col_indices = feat_info['col_indices']
+            if len(col_indices) == 1:
+                # Binary: value is 0 or 1
+                orig_cats.append(int(X[sample_idx, col_indices[0]]))
+            else:
+                # Multiclass: find which one-hot is 1
+                orig_cats.append(int(np.argmax(X[sample_idx, col_indices])))
+        
+        # Find index of this combination
+        orig_combo = tuple(orig_cats)
+        original_combinations[sample_idx] = all_combinations.index(orig_combo)
+    
+    # Create flipped versions for each combination
+    flipped_versions = []
+    combination_labels = []
+    
+    for combo_idx, combo in enumerate(all_combinations):
+        X_flipped = X.copy()
+        
+        # Set each feature to its target category
+        for feat_idx, (feat_info, target_cat) in enumerate(zip(sensitive_features_info, combo)):
+            col_indices = feat_info['col_indices']
+            
+            if len(col_indices) == 1:
+                # Binary: set to 0 or 1
+                X_flipped[:, col_indices[0]] = target_cat
+            else:
+                # Multiclass: one-hot encode
+                X_flipped[:, col_indices] = 0
+                X_flipped[:, col_indices[target_cat]] = 1
+        
+        flipped_versions.append(X_flipped)
+        combination_labels.append(combo)
+    
+    return flipped_versions, combination_labels, original_combinations
+
+
+def counterfactual_consistency_multi_sensitive_exhaustive(
+    y_pred_original: np.ndarray,
+    y_preds_flipped: List[np.ndarray],
+    original_combinations: np.ndarray,
+) -> float:
+    """
+    Calculate counterfactual consistency for multiple sensitive features.
+    
+    For each sample, compares original prediction to predictions for ALL other
+    combinations of sensitive features.
+    
+    Parameters
+    ----------
+    y_pred_original : np.ndarray
+        Original predictions (n_samples,)
+    y_preds_flipped : list of np.ndarray
+        Predictions for each combination, list of arrays each (n_samples,)
+    original_combinations : np.ndarray
+        Index of original combination for each sample (n_samples,)
+        
+    Returns
+    -------
+    consistency : float
+        Fraction of consistent predictions across all valid flips (0 to 1)
+    """
+    n_samples = len(y_pred_original)
+    n_combinations = len(y_preds_flipped)
+    
+    total_consistent = 0
+    total_comparisons = 0
+    
+    for sample_idx in range(n_samples):
+        orig_combo = original_combinations[sample_idx]
+        orig_pred = y_pred_original[sample_idx]
+        
+        # Compare to ALL other combinations (skip original)
+        for combo_idx in range(n_combinations):
+            if combo_idx == orig_combo:
+                continue  # Skip - same combination
+            
+            flipped_pred = y_preds_flipped[combo_idx][sample_idx]
             if orig_pred == flipped_pred:
                 total_consistent += 1
             total_comparisons += 1
